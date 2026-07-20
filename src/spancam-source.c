@@ -523,7 +523,11 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 				av_frame_unref(f);
 				continue;
 			}
-			av_frame_unref(f);
+			// The transfer moves pixels only — colour and timing metadata do not
+			// come with them. Copy the props across before f is reassigned, since
+			// the range check further down reads color_range off the frame.
+			av_frame_copy_props(ctx->sw_frame, f);
+			av_frame_unref(f); // the GPU surface has been copied out
 			f = ctx->sw_frame;
 		}
 
