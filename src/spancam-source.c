@@ -809,6 +809,12 @@ done:
 	ctx->ctrl_fd = -1; // the control channel goes away with the connection
 	spancam_close_decoder(ctx);
 	close(fd);
+	// Tell OBS the source has no picture. Without this the async texture stays
+	// active and OBS keeps rendering the last frame it was given — forever. Pull
+	// the cable mid-stream and your face stays on the broadcast, frozen, with no
+	// indication anything is wrong. Idempotent, so calling it on every disconnect
+	// is fine.
+	obs_source_output_video(ctx->source, NULL);
 }
 
 static void *spancam_receive_loop(void *data)
