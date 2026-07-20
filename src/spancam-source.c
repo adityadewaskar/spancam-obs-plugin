@@ -59,6 +59,15 @@ struct spancam_source {
 	int port;
 	char *token;
 
+	// Auto-mode USB cooldown. A USB connection that CONNECTS but never produces a
+	// valid stream (flaky wireless-adb tunnel, a forward pointing at the wrong
+	// device, app not discoverable) would otherwise loop forever: connect, no
+	// header, disconnect, connect... Wi-Fi never gets a look in because the connect
+	// itself keeps succeeding. So Auto benches USB until this deadline. Cleared the
+	// moment USB does yield a header, so USB stays the preference. Auto only —
+	// explicit USB mode never cools down, because the user asked for USB. (os_gettime_ns)
+	int64_t usb_cooldown_until_ns;
+
 	// Decoder (rebuilt per connection from the StreamHeader codec byte).
 	const AVCodec *codec;
 	AVCodecContext *ctx;
@@ -328,7 +337,8 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 // then hands back both ::1 and 127.0.0.1 and spancam_connect tries each in turn,
 // so a machine whose IPv4 loopback has been remapped or removed still connects
 // over ::1. `adb forward` listens on both.
-static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toksz, char *label_out, size_t lblsz)
+static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toksz, char *label_out, size_t lblsz,
+			bool *used_usb)
 {
 	pthread_mutex_lock(&ctx->cfg_lock);
 	int mode = ctx->connection;
@@ -339,15 +349,20 @@ static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toks
 
 	int fd = -1;
 	token_out[0] = 0;
+	*used_usb = false;
+
+	// In Auto, skip USB while it's benched (see usb_cooldown_until_ns).
+	bool usb_cooling = (mode == SPANCAM_CONN_AUTO) && (ctx->usb_cooldown_until_ns > (int64_t)os_gettime_ns());
 
 	// ---- USB, if a phone is plugged in ----
-	if ((mode == SPANCAM_CONN_USB || mode == SPANCAM_CONN_AUTO) && spancam_adb_has_device()) {
+	if ((mode == SPANCAM_CONN_USB || (mode == SPANCAM_CONN_AUTO && !usb_cooling)) && spancam_adb_has_device()) {
 		char cmd[64];
 		snprintf(cmd, sizeof(cmd), "adb forward tcp:%d tcp:%d", SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
 		spancam_run(cmd);
 		fd = spancam_connect("localhost", SPANCAM_DEFAULT_PORT);
 		if (fd >= 0) {
 			token_out[0] = 0; // tokenless on loopback
+			*used_usb = true;
 			snprintf(label_out, lblsz, "USB localhost:%d", SPANCAM_DEFAULT_PORT);
 			goto done;
 		}
@@ -390,7 +405,9 @@ static void spancam_stream_once(struct spancam_source *ctx)
 {
 	char token[128] = {0};
 	char label[160] = {0};
-	int fd = spancam_dial(ctx, token, sizeof(token), label, sizeof(label));
+	bool used_usb = false;
+	bool got_stream = false; // a valid StreamHeader arrived => this path actually works
+	int fd = spancam_dial(ctx, token, sizeof(token), label, sizeof(label), &used_usb);
 	if (fd < 0)
 		return;
 	obs_log(LOG_INFO, "Spancam: connected (%s)", label);
@@ -410,6 +427,9 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	uint8_t codec_byte = hdr[4];
 	if (!spancam_open_decoder(ctx, codec_byte))
 		goto done;
+	got_stream = true;
+	if (used_usb)
+		ctx->usb_cooldown_until_ns = 0; // USB delivered — keep preferring it
 	obs_log(LOG_INFO, "Spancam: stream %ux%u %s @ %u fps", be32(hdr + 8), be32(hdr + 12),
 		codec_byte == 1 ? "HEVC" : "H.264", be32(hdr + 16));
 
@@ -437,6 +457,12 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	bfree(payload);
 
 done:
+	// Connected over USB but never got a header => bench USB so Auto tries Wi-Fi
+	// for a while instead of spinning on a tunnel that connects and then says
+	// nothing. A USB connection that DID stream cleared the cooldown above, so an
+	// ordinary disconnect reconnects straight back over USB.
+	if (used_usb && !got_stream)
+		ctx->usb_cooldown_until_ns = (int64_t)os_gettime_ns() + 8000000000LL; // 8 s
 	spancam_close_decoder(ctx);
 	close(fd);
 }
