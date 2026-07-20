@@ -49,6 +49,7 @@ typedef int spancam_socklen_t;
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h> // TCP_NODELAY
 #include <arpa/inet.h>
 #include <netdb.h>
 typedef int spancam_socket_t;
