@@ -334,27 +334,35 @@ static bool spancam_udp_discover(struct spancam_source *ctx, char *host, size_t 
 // frame on the device whose battery and thermal budget we care about, when this
 // end is idle by comparison. src is sw x sh with stride sstride; dstride is the
 // output row width, which for 90/270 is the rotated geometry.
+//
+// ORDER MATTERS. Rotate first with no mirror, THEN flip horizontally in DISPLAY
+// space (dx = dstride - 1 - dx). Flipping the source x before rotating flips
+// whichever axis the rotation happens to map it onto — at 90 and 270 that is the
+// vertical one, and a vertical flip on top of a quarter turn reads to the eye as
+// a 180° rotation. dstride is the post-rotation row width, so it doubles as the
+// flip axis and the two cases can't drift apart.
 static void spancam_xform_plane(const uint8_t *src, int sw, int sh, int sstride, uint8_t *dst, int dstride, int rot,
 				int mir)
 {
 	for (int y = 0; y < sh; y++) {
 		const uint8_t *srow = src + (size_t)y * sstride;
 		for (int x = 0; x < sw; x++) {
-			int mx = mir ? sw - 1 - x : x;
 			int dx, dy;
 			if (rot == 90) {
 				dx = sh - 1 - y;
-				dy = mx;
+				dy = x;
 			} else if (rot == 180) {
-				dx = sw - 1 - mx;
+				dx = sw - 1 - x;
 				dy = sh - 1 - y;
 			} else if (rot == 270) {
 				dx = y;
-				dy = sw - 1 - mx;
+				dy = sw - 1 - x;
 			} else { // rot 0
-				dx = mx;
+				dx = x;
 				dy = y;
 			}
+			if (mir)
+				dx = dstride - 1 - dx; // h-flip in display space, AFTER rotation
 			dst[(size_t)dy * dstride + dx] = srow[x];
 		}
 	}
