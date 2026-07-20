@@ -68,6 +68,10 @@ struct spancam_source {
 	int64_t ts_base_pts_us;
 	int64_t ts_base_obs_ns;
 
+	// Upstream control channel (plugin -> phone). Single writer: the receive thread.
+	int ctrl_fd;                // socket to send control frames on (-1 = none)
+	int64_t last_kf_request_ns; // debounce keyframe requests — no IDR storms
+
 	// Auto-mode USB cooldown. A USB connection that CONNECTS but never produces a
 	// valid stream (flaky wireless-adb tunnel, a forward pointing at the wrong
 	// device, app not discoverable) would otherwise loop forever: connect, no
@@ -148,6 +152,33 @@ static uint32_t be32(const uint8_t *p)
 static uint64_t be64(const uint8_t *p)
 {
 	return ((uint64_t)be32(p) << 32) | be32(p + 4);
+}
+
+// --------------------------------------------------------------------------
+// Upstream control channel (plugin -> phone).
+//
+// The stream socket is bidirectional and the phone already speaks a
+// [type:u32 BE][len:u32 BE][payload] control framing, so there's no second
+// connection and no new parser on the phone side. Written only from the receive
+// thread, which is the only thread that has a live fd.
+// --------------------------------------------------------------------------
+static void spancam_send_control(struct spancam_source *ctx, uint32_t type, const uint8_t *payload, uint32_t len)
+{
+	if (ctx->ctrl_fd < 0)
+		return;
+	uint8_t hdr[8] = {
+		(uint8_t)(type >> 24), (uint8_t)(type >> 16), (uint8_t)(type >> 8), (uint8_t)type,
+		(uint8_t)(len >> 24),  (uint8_t)(len >> 16),  (uint8_t)(len >> 8),  (uint8_t)len,
+	};
+	if (send(ctx->ctrl_fd, hdr, sizeof(hdr), 0) < 0)
+		return;
+	if (len > 0 && payload)
+		send(ctx->ctrl_fd, payload, len, 0);
+}
+
+static void spancam_send_keyframe(struct spancam_source *ctx)
+{
+	spancam_send_control(ctx, 0x34, NULL, 0); // requestKeyFrame, empty payload
 }
 
 // --------------------------------------------------------------------------
@@ -293,8 +324,18 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 
 	int ret = avcodec_send_packet(ctx->ctx, pkt);
 	av_packet_free(&pkt);
-	if (ret < 0)
+	if (ret < 0) {
+		// Decode error / desync: ask for a fresh IDR rather than showing smeared
+		// garbage until the next scheduled one. Debounced ~500ms, because a corrupt
+		// burst is many failed packets in a row and each one asking for its own IDR
+		// would bury an already-struggling link in keyframes.
+		int64_t now = (int64_t)os_gettime_ns();
+		if (now - ctx->last_kf_request_ns > 500000000LL) {
+			ctx->last_kf_request_ns = now;
+			spancam_send_keyframe(ctx);
+		}
 		return;
+	}
 
 	while (avcodec_receive_frame(ctx->ctx, ctx->frame) == 0) {
 		AVFrame *f = ctx->frame;
@@ -452,6 +493,11 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	if (used_usb)
 		ctx->usb_cooldown_until_ns = 0; // USB delivered — keep preferring it
 	ctx->ts_base_set = false; // re-anchor the pacing grid for this connection
+	// Ask for a clean IDR straight away: the phone runs a long GOP, so joining
+	// mid-stream otherwise shows nothing at all until the next scheduled keyframe.
+	ctx->ctrl_fd = fd;
+	ctx->last_kf_request_ns = 0;
+	spancam_send_keyframe(ctx);
 	obs_log(LOG_INFO, "Spancam: stream %ux%u %s @ %u fps", be32(hdr + 8), be32(hdr + 12),
 		codec_byte == 1 ? "HEVC" : "H.264", be32(hdr + 16));
 
@@ -485,6 +531,7 @@ done:
 	// ordinary disconnect reconnects straight back over USB.
 	if (used_usb && !got_stream)
 		ctx->usb_cooldown_until_ns = (int64_t)os_gettime_ns() + 8000000000LL; // 8 s
+	ctx->ctrl_fd = -1; // the control channel goes away with the connection
 	spancam_close_decoder(ctx);
 	close(fd);
 }
@@ -547,6 +594,7 @@ static void *spancam_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct spancam_source *ctx = bzalloc(sizeof(struct spancam_source));
 	ctx->source = source;
+	ctx->ctrl_fd = -1; // no control socket until a connection is live
 	pthread_mutex_init(&ctx->cfg_lock, NULL);
 	os_event_init(&ctx->stop_signal, OS_EVENT_TYPE_MANUAL);
 	spancam_source_update(ctx, settings);

@@ -96,6 +96,25 @@ have connected to something that is not a Spancam phone.
   reconfigure. Fed to the decoder ahead of any frame.
 - **type 2 (videoFrame)** — one Annex-B access unit.
 
+## Control channel (plugin → phone)
+
+The stream socket is bidirectional, so upstream control rides the same connection —
+no second port, no second listener. Frames are
+`[type:u32][len:u32][payload]`, big-endian like everything else:
+
+| type   | payload | meaning |
+|--------|---------|---------|
+| `0x34` | *(empty)* | **requestKeyFrame** — encode an IDR now |
+
+`0x34` is sent immediately after the StreamHeader, and again whenever the decoder
+rejects a packet. The phone runs a long GOP to save bandwidth, so a client that
+joins mid-stream has nothing decodable until the next scheduled keyframe; asking
+for one turns a multi-second black wait into an immediate picture.
+
+Keyframe requests are debounced by the plugin (~500 ms). A corrupt burst is many
+consecutive decode failures, and one IDR per failure would flood a link that is
+already in trouble.
+
 ## Decode (plugin)
 
 1. `avcodec_find_decoder(codec == 1 ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264)`, then
