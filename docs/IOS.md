@@ -1,9 +1,12 @@
 # iOS sender
 
-**Status: in progress.** The iOS Spancam app does not yet ship an SDSP sender, so
-the plugin can't take an iPhone feed today. This note is the design for it — the
-plugin end already works, since SDSP is transport-agnostic. When the app ships the
-sender, an iPhone will appear to the plugin exactly like an Android phone.
+**Status: implemented, pending device verification.** The iOS Spancam app ships an
+SDSP sender (`ObsDirectStream`): an `NWListener` TCP server that reuses the app's
+VideoToolbox encoder and camera capture, byte-for-byte wire-compatible with the
+Android sender and this plugin. It advertises over Bonjour (`_spancam-sdsp._tcp`),
+which the plugin browses for on macOS; on any platform you can also enter the
+phone's IP + port + access key by hand (the app shows them). The design below is
+what was built.
 
 ## Why it's cheap
 

@@ -39,7 +39,17 @@ know which of its addresses the desktop can reach; the datagram that just arrive
 is proof.
 
 Broadcast does not cross subnets, and plenty of networks (guest Wi-Fi, most
-enterprise APs, anything with client isolation on) drop it entirely. Discovery is
+enterprise APs, anything with client isolation on) drop it entirely.
+
+### Bonjour (mDNS)
+
+iOS can't answer a UDP broadcast without a special entitlement, so the iOS sender
+advertises a Bonjour service `_spancam-sdsp._tcp` instead, with a TXT record
+carrying `token` (the access key) and `port`. On macOS the plugin also browses for
+this service and takes the host + SRV port + token from it — so an iPhone is found
+the same "just works" way an Android phone is. The plugin reads the SRV port rather
+than guessing it. (Android is found by the UDP broadcast above; the two discovery
+methods run side by side.) Discovery is
 therefore a convenience, never a requirement — typing the host in by hand has to
 stay a first-class path.
 

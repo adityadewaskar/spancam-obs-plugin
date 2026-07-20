@@ -69,6 +69,11 @@ typedef socklen_t spancam_socklen_t;
 #include <libavutil/pixfmt.h>
 #include <libavutil/hwcontext.h> // VideoToolbox decode, via the generic hwaccel API
 
+#if defined(__APPLE__)
+#include <dns_sd.h>     // Bonjour browse/resolve — finds the iOS sender (macOS system lib)
+#include <sys/select.h> // select() to pump the DNSServiceRef synchronously
+#endif
+
 #define SPANCAM_DEFAULT_PORT 8892
 #define SPANCAM_DISCOVERY_PORT 8891
 #define SPANCAM_PROBE "SPANCAM-DISCOVER"
@@ -77,6 +82,15 @@ typedef socklen_t spancam_socklen_t;
 #define SPANCAM_RECV_TIMEOUT_MS 500
 
 // Connection mode (the "Connection" dropdown).
+// Announced in the handshake so the phone can show which computer connected.
+#if defined(__APPLE__)
+#define SPANCAM_OS "macOS"
+#elif defined(_WIN32)
+#define SPANCAM_OS "Windows"
+#else
+#define SPANCAM_OS "Linux"
+#endif
+
 #define SPANCAM_CONN_AUTO 0
 #define SPANCAM_CONN_USB 1
 #define SPANCAM_CONN_WIFI 2
@@ -395,6 +409,104 @@ static bool spancam_udp_discover(struct spancam_source *ctx, char *host, size_t 
 	spancam_closesocket(fd);
 	return ok;
 }
+
+#if defined(__APPLE__)
+// Bonjour discovery (macOS). The iOS sender can't answer the UDP broadcast above
+// without the multicast entitlement, so it advertises `_spancam-sdsp._tcp` over
+// mDNS instead; this browses for it. Uses the SRV record's port (so the port is
+// never guessed) and the "token" TXT value. macOS-only — Windows/Linux fall back
+// to the manual host for iOS. (Android is found by the UDP path above.)
+struct spancam_mdns_state {
+	bool have_service;
+	char name[128], regtype[64], domain[128];
+	uint32_t ifIndex;
+	bool have_resolve;
+	char hosttarget[256];
+	int port;
+	char token[128];
+};
+
+static void spancam_mdns_pump(DNSServiceRef ref, int timeout_ms)
+{
+	int fd = DNSServiceRefSockFD(ref);
+	if (fd < 0)
+		return;
+	fd_set set;
+	FD_ZERO(&set);
+	FD_SET(fd, &set);
+	struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
+	if (select(fd + 1, &set, NULL, NULL, &tv) > 0 && FD_ISSET(fd, &set))
+		DNSServiceProcessResult(ref);
+}
+
+static void DNSSD_API spancam_browse_cb(DNSServiceRef ref, DNSServiceFlags flags, uint32_t ifIndex,
+					DNSServiceErrorType err, const char *name, const char *regtype,
+					const char *domain, void *ctxv)
+{
+	UNUSED_PARAMETER(ref);
+	struct spancam_mdns_state *st = ctxv;
+	if (err == kDNSServiceErr_NoError && (flags & kDNSServiceFlagsAdd) && !st->have_service) {
+		snprintf(st->name, sizeof(st->name), "%s", name);
+		snprintf(st->regtype, sizeof(st->regtype), "%s", regtype);
+		snprintf(st->domain, sizeof(st->domain), "%s", domain);
+		st->ifIndex = ifIndex;
+		st->have_service = true;
+	}
+}
+
+static void DNSSD_API spancam_resolve_cb(DNSServiceRef ref, DNSServiceFlags flags, uint32_t ifIndex,
+					 DNSServiceErrorType err, const char *fullname, const char *hosttarget,
+					 uint16_t port, uint16_t txtLen, const unsigned char *txt, void *ctxv)
+{
+	UNUSED_PARAMETER(ref);
+	UNUSED_PARAMETER(flags);
+	UNUSED_PARAMETER(ifIndex);
+	UNUSED_PARAMETER(fullname);
+	struct spancam_mdns_state *st = ctxv;
+	if (err != kDNSServiceErr_NoError)
+		return;
+	snprintf(st->hosttarget, sizeof(st->hosttarget), "%s", hosttarget);
+	st->port = ntohs(port);
+	uint8_t tl = 0;
+	const void *tv = TXTRecordGetValuePtr(txtLen, txt, "token", &tl);
+	if (tv && tl > 0 && tl < sizeof(st->token)) {
+		memcpy(st->token, tv, tl);
+		st->token[tl] = 0;
+	}
+	st->have_resolve = true;
+}
+
+static bool spancam_mdns_discover(struct spancam_source *ctx, char *host, size_t hostsz, int *port, char *token,
+				  size_t toksz)
+{
+	struct spancam_mdns_state st = {0};
+	DNSServiceRef browse = NULL;
+	if (DNSServiceBrowse(&browse, 0, kDNSServiceInterfaceIndexAny, "_spancam-sdsp._tcp", NULL, spancam_browse_cb,
+			     &st) != kDNSServiceErr_NoError)
+		return false;
+	for (int i = 0; i < 7 && !st.have_service && os_event_try(ctx->stop_signal) == EAGAIN; i++)
+		spancam_mdns_pump(browse, 100);
+	DNSServiceRefDeallocate(browse);
+	if (!st.have_service)
+		return false;
+
+	DNSServiceRef resolve = NULL;
+	if (DNSServiceResolve(&resolve, 0, st.ifIndex, st.name, st.regtype, st.domain, spancam_resolve_cb, &st) !=
+	    kDNSServiceErr_NoError)
+		return false;
+	for (int i = 0; i < 7 && !st.have_resolve && os_event_try(ctx->stop_signal) == EAGAIN; i++)
+		spancam_mdns_pump(resolve, 100);
+	DNSServiceRefDeallocate(resolve);
+	if (!st.have_resolve)
+		return false;
+
+	// hosttarget is an mDNS name like "iPhone.local." — getaddrinfo resolves it.
+	snprintf(host, hostsz, "%s", st.hosttarget);
+	*port = st.port;
+	snprintf(token, toksz, "%s", st.token);
+	return true;
+}
+#endif // __APPLE__
 
 // --------------------------------------------------------------------------
 // FFmpeg decode -> OBS.
@@ -821,7 +933,11 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 			snprintf(token, sizeof(token), "%s", mtoken);
 			resolved = true;
 		} else if (spancam_udp_discover(ctx, host, sizeof(host), &port, token, sizeof(token))) {
-			resolved = true;
+			resolved = true; // Android answers the UDP broadcast
+#if defined(__APPLE__)
+		} else if (spancam_mdns_discover(ctx, host, sizeof(host), &port, token, sizeof(token))) {
+			resolved = true; // iOS advertises over Bonjour (mDNS)
+#endif
 		}
 		if (resolved) {
 			fd = spancam_connect(host, port);
@@ -849,10 +965,11 @@ static void spancam_stream_once(struct spancam_source *ctx)
 		return;
 	obs_log(LOG_INFO, "Spancam: connected (%s)", label);
 
-	// Handshake: "SPANCAM/1 k=<token>\n"
+	// Handshake: "SPANCAM/1 k=<token> app=OBS os=<os>\n". The token gates Wi-Fi
+	// access; app/os are optional and only let the phone show who connected.
 	struct dstr hello;
 	dstr_init(&hello);
-	dstr_printf(&hello, "SPANCAM/1 k=%s\n", token);
+	dstr_printf(&hello, "SPANCAM/1 k=%s app=OBS os=%s\n", token, SPANCAM_OS);
 	send(fd, hello.array, (int)hello.len, 0);
 	dstr_free(&hello);
 

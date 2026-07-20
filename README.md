@@ -89,7 +89,7 @@ The plugin runs `adb forward` itself and connects over loopback.
 | Windows | 10/11 x64 — builds in CI, community testing wanted |
 | Linux | Ubuntu 24.04 x86_64 — builds in CI, community testing wanted |
 | Android app | H.264 + HEVC sender — **verified** (Galaxy S24 Ultra) |
-| iOS app | in progress — see [docs/IOS.md](docs/IOS.md) |
+| iOS app | sender implemented (Bonjour discovery on macOS, or manual IP anywhere) — pending device verification, see [docs/IOS.md](docs/IOS.md) |
 
 ## Build from source
 
