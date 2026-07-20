@@ -33,11 +33,11 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.adewaskar.obs-spancam"
+            "bundleId": "com.adewaskar.spancam-for-obs"
         }
     },
-    "name": "obs-spancam",
-    "displayName": "Spancam",
+    "name": "spancam-for-obs",
+    "displayName": "Spancam for OBS",
     "version": "0.1.0",
     "author": "Aditya Dewaskar",
     "website": "https://adewaskar.com/apps/spancam",

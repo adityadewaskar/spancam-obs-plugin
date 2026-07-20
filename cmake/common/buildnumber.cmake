@@ -24,6 +24,11 @@ if(NOT DEFINED PLUGIN_BUILD_NUMBER)
       else()
         set(PLUGIN_BUILD_NUMBER "1")
       endif()
+    else()
+      # Local build, no cache file yet: seed to 1 so a fresh checkout configures.
+      # Without this PLUGIN_BUILD_NUMBER is left empty and set_target_properties
+      # downstream fails with "incorrect number of arguments".
+      set(PLUGIN_BUILD_NUMBER "1")
     endif()
   endif()
   file(WRITE "${_BUILD_NUMBER_CACHE}" "${PLUGIN_BUILD_NUMBER}")

@@ -465,6 +465,20 @@ static enum video_format spancam_obs_format(enum AVPixelFormat f)
 	}
 }
 
+// Latency settings, applied before avcodec_open2 on both the HW and SW paths.
+// LOW_DELAY tells the decoder not to hold frames back for reordering, which is
+// correct here because the phone encodes without B-frames — DTS equals PTS, so
+// there is nothing to reorder and any buffering is pure added latency.
+// FF_THREAD_SLICE rather than FF_THREAD_FRAME for the same reason: frame
+// threading wins throughput by working on several frames at once, and paying a
+// frame or more of latency for throughput is the wrong trade for a live camera.
+static void spancam_tune_decoder(AVCodecContext *c)
+{
+	c->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	c->flags2 |= AV_CODEC_FLAG2_FAST;
+	c->thread_type = FF_THREAD_SLICE;
+}
+
 // libavcodec's get_format callback. Hardware decode does not work without it:
 // the default callback only auto-selects hardware pixel formats flagged
 // METHOD_INTERNAL, and the ones we want (VideoToolbox, D3D11VA, VA-API) are
