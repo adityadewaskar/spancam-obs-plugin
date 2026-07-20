@@ -16,6 +16,31 @@ on the computer. Transport is plain TCP, and all multi-byte integers are
 The phone is the server rather than the client because it is the thing that moves
 between networks: OBS sits still, the phone comes and goes.
 
+## Discovery (UDP broadcast)
+
+So that nobody has to read an IP address off a phone screen and type it into OBS:
+
+- The phone runs a UDP responder on **8891**. On receiving the ASCII probe
+  `SPANCAM-DISCOVER` it replies, to the sender, with one line:
+
+  ```
+  SPANCAM-OBS|<name>|<port>|<token>|<codec>|<width>|<height>
+  ```
+
+- The plugin broadcasts `SPANCAM-DISCOVER` to `255.255.255.255:8891`, takes the
+  first reply, and uses the reply's **source address** as the host — plus the
+  `port` and `token` from the payload.
+
+The host deliberately comes from the packet's source address rather than anything
+the phone says about itself. A phone with several interfaces up does not reliably
+know which of its addresses the desktop can reach; the datagram that just arrived
+is proof.
+
+Broadcast does not cross subnets, and plenty of networks (guest Wi-Fi, most
+enterprise APs, anything with client isolation on) drop it entirely. Discovery is
+therefore a convenience, never a requirement — typing the host in by hand has to
+stay a first-class path.
+
 ## Handshake
 
 On connect the client sends one ASCII line, terminated by `\n`:

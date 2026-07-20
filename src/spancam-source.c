@@ -35,6 +35,8 @@ Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
 #include <libavutil/pixfmt.h>
 
 #define SPANCAM_DEFAULT_PORT 8892
+#define SPANCAM_DISCOVERY_PORT 8891
+#define SPANCAM_PROBE "SPANCAM-DISCOVER"
 #define SPANCAM_MAGIC 0x53504331u // 'SPC1'
 #define SPANCAM_RECONNECT_MS 1500
 #define SPANCAM_RECV_TIMEOUT_MS 500
@@ -47,7 +49,7 @@ struct spancam_source {
 	bool thread_running;
 
 	pthread_mutex_t cfg_lock;
-	char *host;
+	char *host; // blank = find a phone by broadcast
 	int port;
 	char *token;
 
@@ -122,6 +124,60 @@ static uint32_t be32(const uint8_t *p)
 static uint64_t be64(const uint8_t *p)
 {
 	return ((uint64_t)be32(p) << 32) | be32(p + 4);
+}
+
+// --------------------------------------------------------------------------
+// Discovery (UDP broadcast), so nobody has to read an IP address off a phone
+// screen and type it into OBS.
+// --------------------------------------------------------------------------
+
+// Broadcast a probe and parse the first reply.
+// Reply: "SPANCAM-OBS|name|port|token|codec|w|h"; the host is the reply's SOURCE
+// address, not anything the phone claims about itself — a phone behind NAT or
+// with several interfaces up doesn't reliably know which of its addresses we can
+// actually reach, but the packet that just arrived proves one of them.
+static bool spancam_udp_discover(struct spancam_source *ctx, char *host, size_t hostsz, int *port, char *token,
+				 size_t toksz)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return false;
+	int yes = 1;
+	setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+	struct timeval tv = {.tv_sec = 0, .tv_usec = 600000};
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	struct sockaddr_in to = {0};
+	to.sin_family = AF_INET;
+	to.sin_port = htons(SPANCAM_DISCOVERY_PORT);
+	to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+	sendto(fd, SPANCAM_PROBE, sizeof(SPANCAM_PROBE) - 1, 0, (struct sockaddr *)&to, sizeof(to));
+
+	bool ok = false;
+	for (int tries = 0; tries < 4 && os_event_try(ctx->stop_signal) == EAGAIN; tries++) {
+		char buf[256];
+		struct sockaddr_in from = {0};
+		socklen_t flen = sizeof(from);
+		ssize_t n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &flen);
+		if (n <= 0)
+			break;
+		buf[n] = 0;
+		if (strncmp(buf, "SPANCAM-OBS|", 12) != 0)
+			continue;
+		char *fields[8] = {0};
+		int nf = 0;
+		for (char *p = strtok(buf, "|"); p && nf < 8; p = strtok(NULL, "|"))
+			fields[nf++] = p;
+		if (nf >= 4) {
+			snprintf(host, hostsz, "%s", inet_ntoa(from.sin_addr));
+			*port = atoi(fields[2]);
+			snprintf(token, toksz, "%s", fields[3]);
+			ok = true;
+			break;
+		}
+	}
+	close(fd);
+	return ok;
 }
 
 // --------------------------------------------------------------------------
@@ -231,6 +287,16 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	char *token = bstrdup(ctx->token ? ctx->token : "");
 	int port = ctx->port > 0 ? ctx->port : SPANCAM_DEFAULT_PORT;
 	pthread_mutex_unlock(&ctx->cfg_lock);
+
+	// A typed-in host wins; otherwise go looking for one.
+	char dhost[128] = {0};
+	char dtoken[128] = {0};
+	if (!*host && spancam_udp_discover(ctx, dhost, sizeof(dhost), &port, dtoken, sizeof(dtoken))) {
+		bfree(host);
+		bfree(token);
+		host = bstrdup(dhost);
+		token = bstrdup(dtoken);
+	}
 
 	int fd = -1;
 	if (*host)
