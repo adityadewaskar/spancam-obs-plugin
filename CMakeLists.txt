@@ -11,18 +11,25 @@ include(compilerconfig)
 include(defaults)
 include(helpers)
 
+# Vendored from obs-studio so FFmpeg is found the same way across all three
+# platforms (obs-deps on macOS/Windows, pkg-config on Linux) — plain find_library
+# only worked where obs-deps happened to be on the search path.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/finders")
+
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
-# FFmpeg, for the H.264/HEVC decode. obs-deps ships libavcodec/libavutil and the
-# template puts obs-deps on CMAKE_PREFIX_PATH, so find_library resolves them.
-find_library(SPANCAM_AVCODEC avcodec REQUIRED)
-find_library(SPANCAM_AVUTIL avutil REQUIRED)
-find_path(SPANCAM_FFMPEG_INCLUDE libavcodec/avcodec.h REQUIRED)
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${SPANCAM_FFMPEG_INCLUDE})
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${SPANCAM_AVCODEC} ${SPANCAM_AVUTIL})
+# FFmpeg, for the H.264/HEVC decode — the same components and finder obs-studio's
+# own win-dshow plugin uses.
+find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE FFmpeg::avcodec FFmpeg::avutil)
+
+# Winsock, for the sockets on Windows (BSD sockets need no extra link elsewhere).
+if(OS_WINDOWS)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
+endif()
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
