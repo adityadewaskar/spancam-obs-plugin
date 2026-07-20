@@ -316,6 +316,13 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 // Work out where the phone is and connect to it. Returns a connected socket
 // (caller closes) and fills token_out with the key the handshake should carry,
 // plus a label for the log line. -1 if nothing is reachable this round.
+//
+// Auto tries USB first (cheap, zero-config) when adb reports a device, and if that
+// CONNECT fails it falls through to Wi-Fi. It used to commit to USB the instant
+// adb saw a device, so a phone that was plugged in but not forwarding — screen
+// locked, app not open, a stale forward — left Auto retrying a dead socket forever
+// with a perfectly good Wi-Fi path sitting right there. Explicit USB mode is USB
+// only; explicit Wi-Fi is Wi-Fi only. Only Auto gets to change its mind.
 static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toksz, char *label_out, size_t lblsz)
 {
 	pthread_mutex_lock(&ctx->cfg_lock);
@@ -334,9 +341,16 @@ static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toks
 		snprintf(cmd, sizeof(cmd), "adb forward tcp:%d tcp:%d", SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
 		spancam_run(cmd);
 		fd = spancam_connect("127.0.0.1", SPANCAM_DEFAULT_PORT);
-		token_out[0] = 0; // tokenless on loopback
-		snprintf(label_out, lblsz, "USB 127.0.0.1:%d", SPANCAM_DEFAULT_PORT);
-		goto done;
+		if (fd >= 0) {
+			token_out[0] = 0; // tokenless on loopback
+			snprintf(label_out, lblsz, "USB 127.0.0.1:%d", SPANCAM_DEFAULT_PORT);
+			goto done;
+		}
+		obs_log(LOG_INFO, "Spancam: USB loopback connect failed%s",
+			mode == SPANCAM_CONN_USB ? "" : " — falling back to Wi-Fi");
+		if (mode == SPANCAM_CONN_USB)
+			goto done; // USB-only: do not fall back
+		// Auto: fall through to Wi-Fi below.
 	}
 
 	// ---- Wi-Fi: a typed-in host wins, otherwise go looking ----
