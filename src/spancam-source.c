@@ -143,6 +143,10 @@ static int spancam_connect(const char *host, int port)
 		struct timeval tv = {.tv_sec = SPANCAM_RECV_TIMEOUT_MS / 1000,
 				     .tv_usec = (SPANCAM_RECV_TIMEOUT_MS % 1000) * 1000};
 		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		// A 4K keyframe is a lot of bytes arriving at once; the default receive
+		// buffer makes the kernel drop window and the sender stall on it.
+		int rcvbuf = 256 * 1024;
+		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 	}
 	return fd;
 }
@@ -421,6 +425,20 @@ static enum AVPixelFormat spancam_get_format(struct AVCodecContext *avctx, const
 }
 #endif
 
+// Latency settings, applied before avcodec_open2 on both the HW and SW paths.
+// LOW_DELAY tells the decoder not to hold frames back for reordering, which is
+// correct here because the phone encodes without B-frames — DTS equals PTS, so
+// there is nothing to reorder and any buffering is pure added latency.
+// FF_THREAD_SLICE rather than FF_THREAD_FRAME for the same reason: frame
+// threading wins throughput by working on several frames at once, and paying a
+// frame or more of latency for throughput is the wrong trade for a live camera.
+static void spancam_tune_decoder(AVCodecContext *c)
+{
+	c->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	c->flags2 |= AV_CODEC_FLAG2_FAST;
+	c->thread_type = FF_THREAD_SLICE;
+}
+
 static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 {
 	enum AVCodecID id = (codec_byte == 1) ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
@@ -442,6 +460,7 @@ static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 		if (ctx->ctx) {
 			ctx->ctx->hw_device_ctx = av_buffer_ref(ctx->hw_device_ctx);
 			ctx->ctx->get_format = spancam_get_format;
+			spancam_tune_decoder(ctx->ctx);
 			if (ctx->ctx->hw_device_ctx && avcodec_open2(ctx->ctx, ctx->codec, NULL) == 0) {
 				ctx->frame = av_frame_alloc();
 				ctx->sw_frame = av_frame_alloc();
@@ -467,6 +486,7 @@ static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 	ctx->ctx = avcodec_alloc_context3(ctx->codec);
 	if (!ctx->ctx)
 		return false;
+	spancam_tune_decoder(ctx->ctx);
 	if (avcodec_open2(ctx->ctx, ctx->codec, NULL) < 0) {
 		avcodec_free_context(&ctx->ctx);
 		return false;
@@ -765,9 +785,12 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	obs_log(LOG_INFO, "Spancam: stream %ux%u %s @ %u fps", be32(hdr + 8), be32(hdr + 12),
 		codec_byte == 1 ? "HEVC" : "H.264", be32(hdr + 16));
 
-	// Packet pump.
+	// Packet pump. The decoder input buffer carries AV_INPUT_BUFFER_PADDING_SIZE
+	// zeroed bytes past the payload: libavcodec's bitstream readers are allowed to
+	// read a little beyond the end of the data, and without the padding that is an
+	// out-of-bounds read that mostly gets away with it.
 	size_t cap = 1 << 20;
-	uint8_t *payload = bmalloc(cap);
+	uint8_t *payload = bmalloc(cap + AV_INPUT_BUFFER_PADDING_SIZE);
 	for (;;) {
 		uint8_t ph[16];
 		if (!spancam_read_full(ctx, fd, ph, sizeof(ph)))
@@ -779,10 +802,11 @@ static void spancam_stream_once(struct spancam_source *ctx)
 			break;
 		if (size > cap) {
 			cap = size;
-			payload = brealloc(payload, cap);
+			payload = brealloc(payload, cap + AV_INPUT_BUFFER_PADDING_SIZE);
 		}
 		if (!spancam_read_full(ctx, fd, payload, size))
 			break;
+		memset(payload + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 		if (type == 1 || type == 2) { // config and frames both go to the decoder
 			if (type == 2)
 				spancam_abr_observe(ctx, pts_us);
