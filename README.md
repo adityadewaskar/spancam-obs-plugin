@@ -33,7 +33,7 @@ of the plugin is to avoid needing that app at all.
 ## Install
 
 Grab the release for your platform from
-[Releases](https://github.com/adityadewaskar/spancam-for-obs/releases), then:
+[Releases](https://github.com/adityadewaskar/spancam-obs-plugin/releases), then:
 
 **macOS** — open the `.pkg` and follow the installer. It installs to
 `~/Library/Application Support/obs-studio/plugins/`. The build is a signed,
