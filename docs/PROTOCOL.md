@@ -9,9 +9,11 @@ on the computer. Transport is plain TCP, and all multi-byte integers are
 
 ## Roles & connect
 
-- **Server:** the phone, bound to `0.0.0.0:8892` so it is reachable over Wi-Fi and,
-  later, over a USB port-forward on the same port.
-- **Client:** the OBS plugin, which connects to `<phone-ip>:8892`.
+- **Server:** the phone, bound to `0.0.0.0:8892` — the wildcard bind is what makes
+  one server answer on both Wi-Fi and USB.
+- **Client:** the OBS plugin.
+  - Wi-Fi: connect to `<phone-ip>:8892`.
+  - USB: `adb forward tcp:8892 tcp:8892`, then connect to loopback.
 
 The phone is the server rather than the client because it is the thing that moves
 between networks: OBS sits still, the phone comes and goes.
@@ -49,9 +51,15 @@ On connect the client sends one ASCII line, terminated by `\n`:
 SPANCAM/1 k=<token>
 ```
 
-`<token>` is the per-session access key shown in the phone app. It gates access on
-a shared network — anyone who can reach port 8892 can otherwise watch your camera.
-A bad token gets the socket closed with no reply.
+`<token>` is the per-session access key shown in the phone app. Token rules:
+
+- **Wi-Fi (non-loopback):** the token must match. Anyone who can reach port 8892
+  could otherwise watch your camera, and 8892 is open on every interface.
+- **USB (loopback, via `adb forward`):** the connection arrives on the phone's own
+  `127.0.0.1`, which nothing off-device can reach, so the token is skipped. USB is
+  meant to be zero-config.
+
+A bad token on Wi-Fi gets the socket closed with no reply.
 
 If accepted, the server replies with a binary **StreamHeader**, then a continuous
 sequence of **Packets** until one side hangs up.

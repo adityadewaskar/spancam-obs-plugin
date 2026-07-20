@@ -41,6 +41,11 @@ Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
 #define SPANCAM_RECONNECT_MS 1500
 #define SPANCAM_RECV_TIMEOUT_MS 500
 
+// Connection mode (the "Connection" dropdown).
+#define SPANCAM_CONN_AUTO 0
+#define SPANCAM_CONN_USB 1
+#define SPANCAM_CONN_WIFI 2
+
 struct spancam_source {
 	obs_source_t *source;
 
@@ -49,7 +54,8 @@ struct spancam_source {
 	bool thread_running;
 
 	pthread_mutex_t cfg_lock;
-	char *host; // blank = find a phone by broadcast
+	int connection; // SPANCAM_CONN_*
+	char *host;     // blank = find a phone by broadcast
 	int port;
 	char *token;
 
@@ -127,9 +133,36 @@ static uint64_t be64(const uint8_t *p)
 }
 
 // --------------------------------------------------------------------------
-// Discovery (UDP broadcast), so nobody has to read an IP address off a phone
-// screen and type it into OBS.
+// Discovery (UDP broadcast) + USB (adb), so nobody has to read an IP address off
+// a phone screen and type it into OBS.
 // --------------------------------------------------------------------------
+
+static void spancam_run(const char *cmd)
+{
+	FILE *f = popen(cmd, "r");
+	if (!f)
+		return;
+	char buf[256];
+	while (fgets(buf, sizeof(buf), f)) {
+	} // drain
+	pclose(f);
+}
+
+// True if `adb devices` lists at least one connected device.
+static bool spancam_adb_has_device(void)
+{
+	FILE *f = popen("adb devices 2>/dev/null", "r");
+	if (!f)
+		return false;
+	char line[256];
+	bool found = false;
+	while (fgets(line, sizeof(line), f)) {
+		if (strstr(line, "\tdevice")) // "<serial>\tdevice"; skips the header line
+			found = true;
+	}
+	pclose(f);
+	return found;
+}
 
 // Broadcast a probe and parse the first reply.
 // Reply: "SPANCAM-OBS|name|port|token|codec|w|h"; the host is the reply's SOURCE
@@ -280,33 +313,68 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 // One connection: handshake, StreamHeader, packet pump.
 // --------------------------------------------------------------------------
 
-static void spancam_stream_once(struct spancam_source *ctx)
+// Work out where the phone is and connect to it. Returns a connected socket
+// (caller closes) and fills token_out with the key the handshake should carry,
+// plus a label for the log line. -1 if nothing is reachable this round.
+static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toksz, char *label_out, size_t lblsz)
 {
 	pthread_mutex_lock(&ctx->cfg_lock);
-	char *host = bstrdup(ctx->host ? ctx->host : "");
-	char *token = bstrdup(ctx->token ? ctx->token : "");
-	int port = ctx->port > 0 ? ctx->port : SPANCAM_DEFAULT_PORT;
+	int mode = ctx->connection;
+	char *mhost = bstrdup(ctx->host ? ctx->host : "");
+	int mport = ctx->port > 0 ? ctx->port : SPANCAM_DEFAULT_PORT;
+	char *mtoken = bstrdup(ctx->token ? ctx->token : "");
 	pthread_mutex_unlock(&ctx->cfg_lock);
 
-	// A typed-in host wins; otherwise go looking for one.
-	char dhost[128] = {0};
-	char dtoken[128] = {0};
-	if (!*host && spancam_udp_discover(ctx, dhost, sizeof(dhost), &port, dtoken, sizeof(dtoken))) {
-		bfree(host);
-		bfree(token);
-		host = bstrdup(dhost);
-		token = bstrdup(dtoken);
+	int fd = -1;
+	token_out[0] = 0;
+
+	// ---- USB, if a phone is plugged in ----
+	if ((mode == SPANCAM_CONN_USB || mode == SPANCAM_CONN_AUTO) && spancam_adb_has_device()) {
+		char cmd[64];
+		snprintf(cmd, sizeof(cmd), "adb forward tcp:%d tcp:%d", SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
+		spancam_run(cmd);
+		fd = spancam_connect("127.0.0.1", SPANCAM_DEFAULT_PORT);
+		token_out[0] = 0; // tokenless on loopback
+		snprintf(label_out, lblsz, "USB 127.0.0.1:%d", SPANCAM_DEFAULT_PORT);
+		goto done;
 	}
 
-	int fd = -1;
-	if (*host)
-		fd = spancam_connect(host, port);
-	if (fd < 0) {
-		bfree(host);
-		bfree(token);
-		return;
+	// ---- Wi-Fi: a typed-in host wins, otherwise go looking ----
+	if (mode != SPANCAM_CONN_USB) {
+		char host[128] = {0};
+		int port = mport;
+		char token[128] = {0};
+		bool resolved = false;
+		if (*mhost) {
+			snprintf(host, sizeof(host), "%s", mhost);
+			snprintf(token, sizeof(token), "%s", mtoken);
+			resolved = true;
+		} else if (spancam_udp_discover(ctx, host, sizeof(host), &port, token, sizeof(token))) {
+			resolved = true;
+		}
+		if (resolved) {
+			fd = spancam_connect(host, port);
+			if (fd >= 0) {
+				snprintf(token_out, toksz, "%s", token);
+				snprintf(label_out, lblsz, "Wi-Fi %s:%d", host, port);
+			}
+		}
 	}
-	obs_log(LOG_INFO, "Spancam: connected to %s:%d", host, port);
+
+done:
+	bfree(mhost);
+	bfree(mtoken);
+	return fd;
+}
+
+static void spancam_stream_once(struct spancam_source *ctx)
+{
+	char token[128] = {0};
+	char label[160] = {0};
+	int fd = spancam_dial(ctx, token, sizeof(token), label, sizeof(label));
+	if (fd < 0)
+		return;
+	obs_log(LOG_INFO, "Spancam: connected (%s)", label);
 
 	// Handshake: "SPANCAM/1 k=<token>\n"
 	struct dstr hello;
@@ -317,7 +385,7 @@ static void spancam_stream_once(struct spancam_source *ctx)
 
 	uint8_t hdr[24];
 	if (!spancam_read_full(ctx, fd, hdr, sizeof(hdr)) || be32(hdr) != SPANCAM_MAGIC) {
-		obs_log(LOG_WARNING, "Spancam: bad or missing stream header");
+		obs_log(LOG_WARNING, "Spancam: bad or missing stream header (%s)", label);
 		goto done;
 	}
 	uint8_t codec_byte = hdr[4];
@@ -352,8 +420,6 @@ static void spancam_stream_once(struct spancam_source *ctx)
 done:
 	spancam_close_decoder(ctx);
 	close(fd);
-	bfree(host);
-	bfree(token);
 }
 
 static void *spancam_receive_loop(void *data)
@@ -378,6 +444,7 @@ static const char *spancam_source_get_name(void *type_data)
 
 static void spancam_source_get_defaults(obs_data_t *settings)
 {
+	obs_data_set_default_int(settings, "connection", SPANCAM_CONN_AUTO);
 	obs_data_set_default_int(settings, "port", SPANCAM_DEFAULT_PORT);
 }
 
@@ -385,6 +452,11 @@ static obs_properties_t *spancam_source_get_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
+	obs_property_t *conn = obs_properties_add_list(props, "connection", obs_module_text("Spancam.Prop.Connection"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(conn, obs_module_text("Spancam.Conn.Auto"), SPANCAM_CONN_AUTO);
+	obs_property_list_add_int(conn, obs_module_text("Spancam.Conn.Usb"), SPANCAM_CONN_USB);
+	obs_property_list_add_int(conn, obs_module_text("Spancam.Conn.Wifi"), SPANCAM_CONN_WIFI);
 	obs_properties_add_text(props, "host", obs_module_text("Spancam.Prop.Host"), OBS_TEXT_DEFAULT);
 	obs_properties_add_int(props, "port", obs_module_text("Spancam.Prop.Port"), 1, 65535, 1);
 	obs_properties_add_text(props, "token", obs_module_text("Spancam.Prop.Token"), OBS_TEXT_DEFAULT);
@@ -397,6 +469,7 @@ static void spancam_source_update(void *data, obs_data_t *settings)
 	pthread_mutex_lock(&ctx->cfg_lock);
 	bfree(ctx->host);
 	bfree(ctx->token);
+	ctx->connection = (int)obs_data_get_int(settings, "connection");
 	ctx->host = bstrdup(obs_data_get_string(settings, "host"));
 	ctx->token = bstrdup(obs_data_get_string(settings, "token"));
 	ctx->port = (int)obs_data_get_int(settings, "port");
