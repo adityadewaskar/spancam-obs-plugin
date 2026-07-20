@@ -14,7 +14,9 @@ buffer is the jitter buffer.
 Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
 
 Builds on macOS, Windows and Linux. The socket layer is BSD sockets with a small
-set of Winsock aliases at the top of this file.
+set of Winsock aliases at the top of this file, and hardware decode goes through
+FFmpeg's generic hwaccel API (VideoToolbox / D3D11VA / VA-API) with a software
+fallback that is always available.
 */
 
 #include <obs-module.h>
@@ -130,12 +132,13 @@ struct spancam_source {
 	AVCodecContext *ctx;
 	AVFrame *frame;
 
-	// VideoToolbox decode on macOS. hw_decode = false means the pure software
-	// path, either because this isn't Apple or because some step below failed and
-	// we fell back. sw_frame is the reusable NV12 download target.
+	// Hardware decode. hw_decode = false means the pure software path, either
+	// because nothing suitable was found or because a step failed and we fell
+	// back. sw_frame is the reusable download target for the GPU surface.
 	AVBufferRef *hw_device_ctx;
 	AVFrame *sw_frame;
 	bool hw_decode;
+	enum AVPixelFormat hw_pix_fmt; // the format get_format must hold out for
 };
 
 // --------------------------------------------------------------------------
@@ -462,37 +465,52 @@ static enum video_format spancam_obs_format(enum AVPixelFormat f)
 	}
 }
 
-// libavcodec's get_format callback, and VideoToolbox does not work without it.
-// Setting hw_device_ctx alone is not enough: the default callback only picks up
-// hardware pixel formats flagged METHOD_INTERNAL, and VT is METHOD_HW_DEVICE_CTX,
-// so it quietly chooses the software format instead. No error, no warning, frames
-// still arrive — just as YUV420P off the CPU decoder. Returning the VT format here
-// is what actually engages the hwaccel. Installed before avcodec_open2, since it
-// can be called during open.
-#if defined(__APPLE__)
+// libavcodec's get_format callback. Hardware decode does not work without it:
+// the default callback only auto-selects hardware pixel formats flagged
+// METHOD_INTERNAL, and the ones we want (VideoToolbox, D3D11VA, VA-API) are
+// METHOD_HW_DEVICE_CTX, so it quietly settles for the software format instead.
+// No error, no warning, frames still arrive — just off the CPU decoder. Holding
+// out for our format here is what actually engages the hwaccel. Installed before
+// avcodec_open2, since open can call it.
 static enum AVPixelFormat spancam_get_format(struct AVCodecContext *avctx, const enum AVPixelFormat *fmts)
 {
-	UNUSED_PARAMETER(avctx);
-	for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
-		if (*p == AV_PIX_FMT_VIDEOTOOLBOX)
-			return AV_PIX_FMT_VIDEOTOOLBOX;
+	struct spancam_source *ctx = avctx->opaque;
+	if (ctx) {
+		for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
+			if (*p == ctx->hw_pix_fmt)
+				return *p;
+		}
 	}
-	return fmts[0]; // VT not on offer — take the software format and carry on
+	return fmts[0]; // not on offer — take the software format and carry on
 }
-#endif
 
-// Latency settings, applied before avcodec_open2 on both the HW and SW paths.
-// LOW_DELAY tells the decoder not to hold frames back for reordering, which is
-// correct here because the phone encodes without B-frames — DTS equals PTS, so
-// there is nothing to reorder and any buffering is pure added latency.
-// FF_THREAD_SLICE rather than FF_THREAD_FRAME for the same reason: frame
-// threading wins throughput by working on several frames at once, and paying a
-// frame or more of latency for throughput is the wrong trade for a live camera.
-static void spancam_tune_decoder(AVCodecContext *c)
+// Hardware decoders worth trying, best first, per platform. Falling off the end
+// of the list is not a failure — it just means software decode.
+static const enum AVHWDeviceType spancam_hw_types[] = {
+#if defined(__APPLE__)
+	AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+#elif defined(_WIN32)
+	AV_HWDEVICE_TYPE_D3D11VA,
+	AV_HWDEVICE_TYPE_CUDA,
+#else
+	AV_HWDEVICE_TYPE_VAAPI,
+	AV_HWDEVICE_TYPE_CUDA,
+	AV_HWDEVICE_TYPE_VDPAU,
+#endif
+	AV_HWDEVICE_TYPE_NONE,
+};
+
+// Ask the decoder itself which pixel format goes with this device type. Guessing
+// is how you end up with a get_format that never matches.
+static enum AVPixelFormat spancam_hw_pix_fmt(const AVCodec *codec, enum AVHWDeviceType type)
 {
-	c->flags |= AV_CODEC_FLAG_LOW_DELAY;
-	c->flags2 |= AV_CODEC_FLAG2_FAST;
-	c->thread_type = FF_THREAD_SLICE;
+	for (int i = 0;; i++) {
+		const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
+		if (!cfg)
+			return AV_PIX_FMT_NONE;
+		if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && cfg->device_type == type)
+			return cfg->pix_fmt;
+	}
 }
 
 static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
@@ -505,15 +523,24 @@ static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 	}
 
 	ctx->hw_decode = false;
+	ctx->hw_pix_fmt = AV_PIX_FMT_NONE;
 
-#if defined(__APPLE__)
-	// Try VideoToolbox first. Best-effort throughout: any step failing falls
-	// through to the software open below, so a machine without VT — or a profile
-	// it won't take — still streams. Ordering is load-bearing: create the device,
-	// set hw_device_ctx AND get_format, and only then avcodec_open2.
-	if (av_hwdevice_ctx_create(&ctx->hw_device_ctx, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0) == 0) {
+	// Try each candidate hardware decoder in turn. Best-effort throughout: any
+	// step failing moves to the next candidate and ultimately to the software
+	// open below, so a machine with no usable GPU decoder — or a profile one
+	// won't take — still streams. Ordering is load-bearing: create the device,
+	// set hw_device_ctx AND get_format AND opaque, and only then avcodec_open2.
+	for (int i = 0; spancam_hw_types[i] != AV_HWDEVICE_TYPE_NONE; i++) {
+		enum AVHWDeviceType type = spancam_hw_types[i];
+		enum AVPixelFormat pix = spancam_hw_pix_fmt(ctx->codec, type);
+		if (pix == AV_PIX_FMT_NONE)
+			continue; // this decoder can't drive that device type
+		if (av_hwdevice_ctx_create(&ctx->hw_device_ctx, type, NULL, NULL, 0) != 0)
+			continue; // no such device on this machine
 		ctx->ctx = avcodec_alloc_context3(ctx->codec);
 		if (ctx->ctx) {
+			ctx->hw_pix_fmt = pix;
+			ctx->ctx->opaque = ctx;
 			ctx->ctx->hw_device_ctx = av_buffer_ref(ctx->hw_device_ctx);
 			ctx->ctx->get_format = spancam_get_format;
 			spancam_tune_decoder(ctx->ctx);
@@ -522,7 +549,8 @@ static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 				ctx->sw_frame = av_frame_alloc();
 				if (ctx->frame && ctx->sw_frame) {
 					ctx->hw_decode = true;
-					obs_log(LOG_INFO, "Spancam: VideoToolbox decode enabled");
+					obs_log(LOG_INFO, "Spancam: %s hardware decode enabled",
+						av_hwdevice_get_type_name(type));
 					return true;
 				}
 				if (ctx->frame)
@@ -533,9 +561,9 @@ static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 			avcodec_free_context(&ctx->ctx); // also drops the ref'd device copy
 		}
 		av_buffer_unref(&ctx->hw_device_ctx);
-		obs_log(LOG_INFO, "Spancam: VideoToolbox unavailable — using software decode");
+		ctx->hw_pix_fmt = AV_PIX_FMT_NONE;
 	}
-#endif
+	obs_log(LOG_INFO, "Spancam: no hardware decoder available — using software decode");
 
 	// Software path. Allocate a fresh context so a half-configured HW one is
 	// never reused.
@@ -564,6 +592,7 @@ static void spancam_close_decoder(struct spancam_source *ctx)
 	av_buffer_unref(&ctx->hw_device_ctx); // NULL-safe
 	ctx->codec = NULL;
 	ctx->hw_decode = false;
+	ctx->hw_pix_fmt = AV_PIX_FMT_NONE;
 }
 
 // Feed one Annex-B access unit (or the codec config) to the decoder and emit
@@ -596,12 +625,12 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 	while (avcodec_receive_frame(ctx->ctx, ctx->frame) == 0) {
 		AVFrame *f = ctx->frame;
 
-		// With VideoToolbox the decoded surface lives on the GPU. Pull it down
-		// into the reusable sw_frame (leaving the format unset lets FFmpeg pick,
-		// which is NV12) and run the rest of the loop against that. A failed
-		// transfer drops this one frame rather than tearing the decoder down — an
-		// IOSurface hiccup shouldn't end the stream.
-		if (f->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+		// A hardware-decoded surface lives on the GPU. Pull it down into the
+		// reusable sw_frame (leaving the format unset lets FFmpeg choose, which is
+		// NV12 on every backend here) and run the rest of the loop against that.
+		// A failed transfer drops this one frame rather than tearing the decoder
+		// down — a transient surface hiccup shouldn't end the stream.
+		if (ctx->hw_decode && f->format == ctx->hw_pix_fmt) {
 			av_frame_unref(ctx->sw_frame);
 			ctx->sw_frame->format = AV_PIX_FMT_NONE;
 			if (av_hwframe_transfer_data(ctx->sw_frame, f, 0) < 0) {
