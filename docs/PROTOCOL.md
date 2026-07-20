@@ -104,6 +104,7 @@ no second port, no second listener. Frames are
 
 | type   | payload | meaning |
 |--------|---------|---------|
+| `0x30` | `[targetBitrate:u32][resolutionIndex:u8]` | **setBitrate** — re-target the encoder |
 | `0x34` | *(empty)* | **requestKeyFrame** — encode an IDR now |
 
 `0x34` is sent immediately after the StreamHeader, and again whenever the decoder
@@ -114,6 +115,21 @@ for one turns a multi-second black wait into an immediate picture.
 Keyframe requests are debounced by the plugin (~500 ms). A corrupt burst is many
 consecutive decode failures, and one IDR per failure would flood a link that is
 already in trouble.
+
+`0x30` makes the **plugin** the bitrate controller. It is the end that can see
+congestion: it knows when each frame arrived and when the PTS said it should have,
+and a one-way delay that keeps growing is queuing on the path — congestion visible
+well before any loss. The phone cannot see this; it only knows it handed bytes to
+a socket.
+
+The rule is the usual asymmetric one: cut hard (×0.85, floor 800 kbps), recover
+gently (+10%), never above the StreamHeader's `bitrate`, which is what the encoder
+was configured for. Sent at most once a second so the encoder is not being
+reconfigured constantly, and the measurement re-anchors after every change so the
+next reading reflects the new rate rather than the old backlog.
+
+The phone is expected to clamp anything unreasonable — the plugin is not trusted
+to name a bitrate the hardware can actually deliver.
 
 ## Decode (plugin)
 

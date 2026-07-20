@@ -69,8 +69,15 @@ struct spancam_source {
 	int64_t ts_base_obs_ns;
 
 	// Upstream control channel (plugin -> phone). Single writer: the receive thread.
-	int ctrl_fd;                // socket to send control frames on (-1 = none)
-	int64_t last_kf_request_ns; // debounce keyframe requests — no IDR storms
+	int ctrl_fd;                  // socket to send control frames on (-1 = none)
+	int abr_target;               // bitrate the phone is currently being asked for
+	int abr_ceiling;              // StreamHeader bitrate — never ask for more than this
+	bool abr_base_set;
+	int64_t abr_base_arrival_ns;  // anchor for the one-way delay measurement
+	int64_t abr_base_pts_us;
+	int64_t abr_delay_ewma_ns;    // smoothed queuing delay since the anchor
+	int64_t abr_last_send_ns;     // rate-limit control frames to ~1 Hz
+	int64_t last_kf_request_ns;   // debounce keyframe requests — no IDR storms
 
 	// Auto-mode USB cooldown. A USB connection that CONNECTS but never produces a
 	// valid stream (flaky wireless-adb tunnel, a forward pointing at the wrong
@@ -179,6 +186,56 @@ static void spancam_send_control(struct spancam_source *ctx, uint32_t type, cons
 static void spancam_send_keyframe(struct spancam_source *ctx)
 {
 	spancam_send_control(ctx, 0x34, NULL, 0); // requestKeyFrame, empty payload
+}
+
+static void spancam_send_bitrate(struct spancam_source *ctx, int bps)
+{
+	uint8_t p[5] = {(uint8_t)(bps >> 24), (uint8_t)(bps >> 16), (uint8_t)(bps >> 8), (uint8_t)bps, 0};
+	spancam_send_control(ctx, 0x30, p, sizeof(p)); // [targetBitrate:u32][resolutionIndex:u8=0]
+}
+
+// Closed-loop bitrate control, delay-gradient style. Watch how far each frame's
+// arrival drifts from where its PTS says it should have arrived: a delay that
+// keeps growing means bytes are queuing somewhere on the path, which is
+// congestion showing up well before packet loss does. Step down hard (x0.85) and
+// climb back gently (+10%) toward the StreamHeader's bitrate, which is the
+// ceiling the encoder was configured for and not ours to exceed.
+//
+// Rate-limited to ~1 Hz so the phone's encoder isn't reconfigured constantly, and
+// re-anchored after every change so the next measurement reflects the new rate
+// rather than the backlog left over from the old one.
+static void spancam_abr_observe(struct spancam_source *ctx, int64_t pts_us)
+{
+	int64_t now = (int64_t)os_gettime_ns();
+	if (!ctx->abr_base_set) {
+		ctx->abr_base_set = true;
+		ctx->abr_base_arrival_ns = now;
+		ctx->abr_base_pts_us = pts_us;
+		ctx->abr_delay_ewma_ns = 0;
+	}
+	int64_t expected = ctx->abr_base_arrival_ns + (pts_us - ctx->abr_base_pts_us) * 1000;
+	int64_t delay = now - expected; // how far behind the grid we've fallen
+	if (delay < 0)
+		delay = 0;
+	ctx->abr_delay_ewma_ns = (ctx->abr_delay_ewma_ns * 7 + delay) / 8;
+	if (ctx->ctrl_fd < 0 || ctx->abr_ceiling <= 0)
+		return;
+	if (now - ctx->abr_last_send_ns < 1000000000LL) // ~1 Hz
+		return;
+	if (ctx->abr_delay_ewma_ns > 250000000LL) { // >250 ms of queue — congested
+		ctx->abr_target = ctx->abr_target * 85 / 100;
+		if (ctx->abr_target < 800000)
+			ctx->abr_target = 800000;
+	} else if (ctx->abr_delay_ewma_ns < 60000000LL && ctx->abr_target < ctx->abr_ceiling) {
+		ctx->abr_target += ctx->abr_target / 10; // +10%
+		if (ctx->abr_target > ctx->abr_ceiling)
+			ctx->abr_target = ctx->abr_ceiling;
+	} else {
+		return; // in between — hold, keep measuring
+	}
+	ctx->abr_last_send_ns = now;
+	spancam_send_bitrate(ctx, ctx->abr_target);
+	ctx->abr_base_set = false; // re-anchor so the next reading reflects the new rate
 }
 
 // --------------------------------------------------------------------------
@@ -496,6 +553,10 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	// Ask for a clean IDR straight away: the phone runs a long GOP, so joining
 	// mid-stream otherwise shows nothing at all until the next scheduled keyframe.
 	ctx->ctrl_fd = fd;
+	ctx->abr_ceiling = (int)be32(hdr + 20);
+	ctx->abr_target = ctx->abr_ceiling;
+	ctx->abr_base_set = false;
+	ctx->abr_last_send_ns = 0;
 	ctx->last_kf_request_ns = 0;
 	spancam_send_keyframe(ctx);
 	obs_log(LOG_INFO, "Spancam: stream %ux%u %s @ %u fps", be32(hdr + 8), be32(hdr + 12),
@@ -519,8 +580,11 @@ static void spancam_stream_once(struct spancam_source *ctx)
 		}
 		if (!spancam_read_full(ctx, fd, payload, size))
 			break;
-		if (type == 1 || type == 2) // config and frames both go to the decoder
+		if (type == 1 || type == 2) { // config and frames both go to the decoder
+			if (type == 2)
+				spancam_abr_observe(ctx, pts_us);
 			spancam_decode(ctx, payload, (int)size, pts_us);
+		}
 	}
 	bfree(payload);
 
