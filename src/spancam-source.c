@@ -323,6 +323,11 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 // locked, app not open, a stale forward — left Auto retrying a dead socket forever
 // with a perfectly good Wi-Fi path sitting right there. Explicit USB mode is USB
 // only; explicit Wi-Fi is Wi-Fi only. Only Auto gets to change its mind.
+//
+// The USB host is the NAME "localhost", never the literal 127.0.0.1: getaddrinfo
+// then hands back both ::1 and 127.0.0.1 and spancam_connect tries each in turn,
+// so a machine whose IPv4 loopback has been remapped or removed still connects
+// over ::1. `adb forward` listens on both.
 static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toksz, char *label_out, size_t lblsz)
 {
 	pthread_mutex_lock(&ctx->cfg_lock);
@@ -340,10 +345,10 @@ static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toks
 		char cmd[64];
 		snprintf(cmd, sizeof(cmd), "adb forward tcp:%d tcp:%d", SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
 		spancam_run(cmd);
-		fd = spancam_connect("127.0.0.1", SPANCAM_DEFAULT_PORT);
+		fd = spancam_connect("localhost", SPANCAM_DEFAULT_PORT);
 		if (fd >= 0) {
 			token_out[0] = 0; // tokenless on loopback
-			snprintf(label_out, lblsz, "USB 127.0.0.1:%d", SPANCAM_DEFAULT_PORT);
+			snprintf(label_out, lblsz, "USB localhost:%d", SPANCAM_DEFAULT_PORT);
 			goto done;
 		}
 		obs_log(LOG_INFO, "Spancam: USB loopback connect failed%s",
