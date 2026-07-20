@@ -8,6 +8,8 @@ A worker thread owns the socket: connect, handshake, read the StreamHeader, then
 pump packets until the far end goes away, then reconnect. Each access unit goes
 to libavcodec (which OBS already ships via obs-deps) and the decoded planes go
 straight to obs_source_output_video — no swscale, OBS takes planar YUV as-is.
+Frames are paced on the encoder's PTS rather than on arrival, so OBS's async
+buffer is the jitter buffer.
 
 Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
 */
@@ -58,6 +60,13 @@ struct spancam_source {
 	char *host;     // blank = find a phone by broadcast
 	int port;
 	char *token;
+
+	// PTS pacing: map the wire pts_us onto a monotonic OBS timebase so OBS's async
+	// source buffer can absorb network jitter, instead of presenting each frame the
+	// instant it happens to arrive. Re-anchored per connection.
+	bool ts_base_set;
+	int64_t ts_base_pts_us;
+	int64_t ts_base_obs_ns;
 
 	// Auto-mode USB cooldown. A USB connection that CONNECTS but never produces a
 	// valid stream (flaky wireless-adb tunnel, a forward pointing at the wrong
@@ -299,7 +308,19 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 
 		struct obs_source_frame frame = {0};
 		frame.format = fmt;
-		frame.timestamp = os_gettime_ns();
+		// Pace on the wire PTS laid onto a monotonic OBS timebase, so OBS's async
+		// buffer smooths jitter out instead of showing frames the moment they land.
+		// Re-anchor on the first frame, on a PTS that goes backwards (the encoder
+		// restarted) and on a wild jump forwards (a corrupt PTS shouldn't strand the
+		// source seconds in the future, with every later frame dropped as too old).
+		int64_t rel_ns = (pts_us - ctx->ts_base_pts_us) * 1000;
+		if (!ctx->ts_base_set || pts_us < ctx->ts_base_pts_us || rel_ns > 10000000000LL) {
+			ctx->ts_base_set = true;
+			ctx->ts_base_pts_us = pts_us;
+			ctx->ts_base_obs_ns = (int64_t)os_gettime_ns();
+			rel_ns = 0;
+		}
+		frame.timestamp = (uint64_t)(ctx->ts_base_obs_ns + rel_ns);
 		frame.width = (uint32_t)f->width;
 		frame.height = (uint32_t)f->height;
 		for (size_t i = 0; i < MAX_AV_PLANES; i++) {
@@ -430,6 +451,7 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	got_stream = true;
 	if (used_usb)
 		ctx->usb_cooldown_until_ns = 0; // USB delivered — keep preferring it
+	ctx->ts_base_set = false; // re-anchor the pacing grid for this connection
 	obs_log(LOG_INFO, "Spancam: stream %ux%u %s @ %u fps", be32(hdr + 8), be32(hdr + 12),
 		codec_byte == 1 ? "HEVC" : "H.264", be32(hdr + 16));
 
