@@ -349,11 +349,18 @@ static bool spancam_udp_discover(struct spancam_source *ctx, char *host, size_t 
 // vertical one, and a vertical flip on top of a quarter turn reads to the eye as
 // a 180° rotation. dstride is the post-rotation row width, so it doubles as the
 // flip axis and the two cases can't drift apart.
+//
+// bpe is bytes per ELEMENT: 1 for an 8-bit plane (I420 Y/U/V, or NV12's Y), 2 for
+// NV12's interleaved UV where one element is the whole (Cb,Cr) pair. sw/sh/sstride
+// and dstride are all in ELEMENTS, not bytes. For UV the mirror moves the pair's
+// position in display space; the two bytes inside it are copied in order and never
+// swapped, because swapping them is how you turn NV12 into NV21. Being a pure
+// permutation of samples, chroma siting comes out unchanged.
 static void spancam_xform_plane(const uint8_t *src, int sw, int sh, int sstride, uint8_t *dst, int dstride, int rot,
-				int mir)
+				int mir, int bpe)
 {
 	for (int y = 0; y < sh; y++) {
-		const uint8_t *srow = src + (size_t)y * sstride;
+		const uint8_t *srow = src + (size_t)y * sstride * bpe;
 		for (int x = 0; x < sw; x++) {
 			int dx, dy;
 			if (rot == 90) {
@@ -371,7 +378,10 @@ static void spancam_xform_plane(const uint8_t *src, int sw, int sh, int sstride,
 			}
 			if (mir)
 				dx = dstride - 1 - dx; // h-flip in display space, AFTER rotation
-			dst[(size_t)dy * dstride + dx] = srow[x];
+			uint8_t *dpx = dst + ((size_t)dy * dstride + dx) * bpe;
+			const uint8_t *spx = srow + (size_t)x * bpe;
+			for (int b = 0; b < bpe; b++) // 1 byte, or the 2-byte UV pair
+				dpx[b] = spx[b];
 		}
 	}
 }
@@ -559,28 +569,52 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 		int mir = ctx->mirror;
 		pthread_mutex_unlock(&ctx->cfg_lock);
 
-		if ((rot != 0 || mir) && f->width > 0 && f->height > 0 && fmt == VIDEO_FORMAT_I420) {
+		if ((rot != 0 || mir) && f->width > 0 && f->height > 0 &&
+		    (fmt == VIDEO_FORMAT_I420 || fmt == VIDEO_FORMAT_NV12)) {
 			int w = f->width, h = f->height;
 			int ow = (rot == 90 || rot == 270) ? h : w; // 90/270 swap W/H
 			int oh = (rot == 90 || rot == 270) ? w : h;
-			size_t ysz = (size_t)ow * oh, csz = (size_t)(ow / 2) * (oh / 2);
-			size_t need = ysz + 2 * csz;
-			if (need > ctx->rotcap) {
-				ctx->rotbuf = brealloc(ctx->rotbuf, need);
-				ctx->rotcap = need;
+			if (fmt == VIDEO_FORMAT_NV12) {
+				// Y as 1-byte elements, then interleaved UV as 2-byte elements
+				// over a w/2 x h/2 grid. f->linesize is in BYTES, so the UV
+				// plane's ELEMENT stride is linesize[1] / 2.
+				size_t ysz = (size_t)ow * oh;
+				size_t uvsz = (size_t)ow * (oh / 2); // (ow/2 pairs) * 2 bytes * (oh/2 rows)
+				size_t need = ysz + uvsz;
+				if (need > ctx->rotcap) {
+					ctx->rotbuf = brealloc(ctx->rotbuf, need);
+					ctx->rotcap = need;
+				}
+				uint8_t *dy = ctx->rotbuf, *duv = dy + ysz;
+				spancam_xform_plane(f->data[0], w, h, f->linesize[0], dy, ow, rot, mir, 1);
+				spancam_xform_plane(f->data[1], w / 2, h / 2, f->linesize[1] / 2, duv, ow / 2, rot,
+						    mir, 2);
+				frame.width = (uint32_t)ow;
+				frame.height = (uint32_t)oh;
+				frame.data[0] = dy;
+				frame.linesize[0] = (uint32_t)ow;
+				frame.data[1] = duv;
+				frame.linesize[1] = (uint32_t)ow; // (ow/2 pairs) * 2 bytes per row
+			} else { // I420, the software-decode path
+				size_t ysz = (size_t)ow * oh, csz = (size_t)(ow / 2) * (oh / 2);
+				size_t need = ysz + 2 * csz;
+				if (need > ctx->rotcap) {
+					ctx->rotbuf = brealloc(ctx->rotbuf, need);
+					ctx->rotcap = need;
+				}
+				uint8_t *dy = ctx->rotbuf, *du = dy + ysz, *dv = du + csz;
+				spancam_xform_plane(f->data[0], w, h, f->linesize[0], dy, ow, rot, mir, 1);
+				spancam_xform_plane(f->data[1], w / 2, h / 2, f->linesize[1], du, ow / 2, rot, mir, 1);
+				spancam_xform_plane(f->data[2], w / 2, h / 2, f->linesize[2], dv, ow / 2, rot, mir, 1);
+				frame.width = (uint32_t)ow;
+				frame.height = (uint32_t)oh;
+				frame.data[0] = dy;
+				frame.linesize[0] = (uint32_t)ow;
+				frame.data[1] = du;
+				frame.linesize[1] = (uint32_t)(ow / 2);
+				frame.data[2] = dv;
+				frame.linesize[2] = (uint32_t)(ow / 2);
 			}
-			uint8_t *dy = ctx->rotbuf, *du = dy + ysz, *dv = du + csz;
-			spancam_xform_plane(f->data[0], w, h, f->linesize[0], dy, ow, rot, mir);
-			spancam_xform_plane(f->data[1], w / 2, h / 2, f->linesize[1], du, ow / 2, rot, mir);
-			spancam_xform_plane(f->data[2], w / 2, h / 2, f->linesize[2], dv, ow / 2, rot, mir);
-			frame.width = (uint32_t)ow;
-			frame.height = (uint32_t)oh;
-			frame.data[0] = dy;
-			frame.linesize[0] = (uint32_t)ow;
-			frame.data[1] = du;
-			frame.linesize[1] = (uint32_t)(ow / 2);
-			frame.data[2] = dv;
-			frame.linesize[2] = (uint32_t)(ow / 2);
 		} else {
 			frame.width = (uint32_t)f->width;
 			frame.height = (uint32_t)f->height;
