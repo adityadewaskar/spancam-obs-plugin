@@ -30,6 +30,22 @@ This is the raw camera. Spancam's on-device effects (eye contact, background,
 super-resolution) live in the desktop app and are not part of this path — the point
 of the plugin is to avoid needing that app at all.
 
+### Adding effects
+
+OBS is built around *sources and filters*, so effects compose on top of this source
+rather than being baked into it:
+
+- **Background removal, blur, colour** — add an OBS filter to the Spancam Camera
+  source. The community [Background Removal](https://github.com/locaal-ai/obs-backgroundremoval)
+  filter works well and runs on your computer, not the phone.
+- **Spancam's own processing** (eye contact, super-resolution, background) — install
+  the Spancam desktop app and pick its **virtual camera** as a regular *Video Capture
+  Device* in OBS. That path runs Spancam's effects on your computer and doesn't use
+  this plugin.
+
+Either way the phone only ever captures and encodes; all image processing happens on
+the computer.
+
 ## Install
 
 Grab the release for your platform from
