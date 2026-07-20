@@ -70,7 +70,7 @@ sequence of **Packets** until one side hangs up.
 |-----|------|----------|-------|
 | 0   | 4    | magic    | `0x53504331` = `"SPC1"` |
 | 4   | 1    | codec    | `0` = H.264, `1` = HEVC |
-| 5   | 1    | flags    | reserved, 0 |
+| 5   | 1    | flags    | bit0 = mirror seed; other bits reserved, 0 |
 | 6   | 2    | reserved | 0 |
 | 8   | 4    | width    | pixels |
 | 12  | 4    | height   | pixels |
@@ -84,7 +84,7 @@ have connected to something that is not a Spancam phone.
 
 | off | size | field    | notes |
 |-----|------|----------|-------|
-| 0   | 1    | type     | `1` = codecConfig, `2` = videoFrame |
+| 0   | 1    | type     | `1` = codecConfig, `2` = videoFrame, `3` = transform |
 | 1   | 1    | keyframe | videoFrame only: `1` if IDR, else `0` |
 | 2   | 2    | reserved | 0 |
 | 4   | 8    | ptsUs    | presentation time in microseconds |
@@ -95,6 +95,17 @@ have connected to something that is not a Spancam phone.
   H.264, VPS+SPS+PPS for HEVC. Sent once at stream start and again on any encoder
   reconfigure. Fed to the decoder ahead of any frame.
 - **type 2 (videoFrame)** — one Annex-B access unit.
+- **type 3 (transform)** — 4-byte payload `[mirror, rotation÷90, 0, 0]`: pixel
+  transforms the **plugin** applies to the decoded frame. `payload[0]` is mirror
+  (0/1, horizontal flip); `payload[1]` is rotation in 90° steps (0–3). Sent right
+  after the StreamHeader, and again whenever the phone's mirror setting or physical
+  orientation changes, so OBS follows a phone being turned without the phone ever
+  touching a pixel. A client that doesn't know type 3 skips it harmlessly and still
+  gets mirror from the StreamHeader flags.
+
+Rotation deliberately lives on this end. Doing it on the phone means a second full
+pass over every frame on the device with the battery and the thermal ceiling, to
+save work on a desktop that is not busy.
 
 ## Control channel (plugin → phone)
 

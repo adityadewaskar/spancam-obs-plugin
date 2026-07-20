@@ -60,6 +60,12 @@ struct spancam_source {
 	char *host;     // blank = find a phone by broadcast
 	int port;
 	char *token;
+	int rotation; // 0/90/180/270, applied here — the phone never resamples pixels
+	int mirror;   // 0/1 horizontal flip, composed with rotation
+
+	// Reusable output buffer for the flipped/rotated frame. Grown as needed.
+	uint8_t *rotbuf;
+	size_t rotcap;
 
 	// PTS pacing: map the wire pts_us onto a monotonic OBS timebase so OBS's async
 	// source buffer can absorb network jitter, instead of presenting each frame the
@@ -323,6 +329,37 @@ static bool spancam_udp_discover(struct spancam_source *ctx, char *host, size_t 
 // FFmpeg decode -> OBS.
 // --------------------------------------------------------------------------
 
+// Rotate and/or horizontally flip one 8-bit plane, here on the computer. The
+// phone deliberately never does this: it would mean a second pass over every
+// frame on the device whose battery and thermal budget we care about, when this
+// end is idle by comparison. src is sw x sh with stride sstride; dstride is the
+// output row width, which for 90/270 is the rotated geometry.
+static void spancam_xform_plane(const uint8_t *src, int sw, int sh, int sstride, uint8_t *dst, int dstride, int rot,
+				int mir)
+{
+	for (int y = 0; y < sh; y++) {
+		const uint8_t *srow = src + (size_t)y * sstride;
+		for (int x = 0; x < sw; x++) {
+			int mx = mir ? sw - 1 - x : x;
+			int dx, dy;
+			if (rot == 90) {
+				dx = sh - 1 - y;
+				dy = mx;
+			} else if (rot == 180) {
+				dx = sw - 1 - mx;
+				dy = sh - 1 - y;
+			} else if (rot == 270) {
+				dx = y;
+				dy = sw - 1 - mx;
+			} else { // rot 0
+				dx = mx;
+				dy = y;
+			}
+			dst[(size_t)dy * dstride + dx] = srow[x];
+		}
+	}
+}
+
 static enum video_format spancam_obs_format(enum AVPixelFormat f)
 {
 	switch (f) {
@@ -419,11 +456,41 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 			rel_ns = 0;
 		}
 		frame.timestamp = (uint64_t)(ctx->ts_base_obs_ns + rel_ns);
-		frame.width = (uint32_t)f->width;
-		frame.height = (uint32_t)f->height;
-		for (size_t i = 0; i < MAX_AV_PLANES; i++) {
-			frame.data[i] = f->data[i];
-			frame.linesize[i] = (uint32_t)f->linesize[i];
+
+		pthread_mutex_lock(&ctx->cfg_lock);
+		int rot = ctx->rotation;
+		int mir = ctx->mirror;
+		pthread_mutex_unlock(&ctx->cfg_lock);
+
+		if ((rot != 0 || mir) && f->width > 0 && f->height > 0 && fmt == VIDEO_FORMAT_I420) {
+			int w = f->width, h = f->height;
+			int ow = (rot == 90 || rot == 270) ? h : w; // 90/270 swap W/H
+			int oh = (rot == 90 || rot == 270) ? w : h;
+			size_t ysz = (size_t)ow * oh, csz = (size_t)(ow / 2) * (oh / 2);
+			size_t need = ysz + 2 * csz;
+			if (need > ctx->rotcap) {
+				ctx->rotbuf = brealloc(ctx->rotbuf, need);
+				ctx->rotcap = need;
+			}
+			uint8_t *dy = ctx->rotbuf, *du = dy + ysz, *dv = du + csz;
+			spancam_xform_plane(f->data[0], w, h, f->linesize[0], dy, ow, rot, mir);
+			spancam_xform_plane(f->data[1], w / 2, h / 2, f->linesize[1], du, ow / 2, rot, mir);
+			spancam_xform_plane(f->data[2], w / 2, h / 2, f->linesize[2], dv, ow / 2, rot, mir);
+			frame.width = (uint32_t)ow;
+			frame.height = (uint32_t)oh;
+			frame.data[0] = dy;
+			frame.linesize[0] = (uint32_t)ow;
+			frame.data[1] = du;
+			frame.linesize[1] = (uint32_t)(ow / 2);
+			frame.data[2] = dv;
+			frame.linesize[2] = (uint32_t)(ow / 2);
+		} else {
+			frame.width = (uint32_t)f->width;
+			frame.height = (uint32_t)f->height;
+			for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+				frame.data[i] = f->data[i];
+				frame.linesize[i] = (uint32_t)f->linesize[i];
+			}
 		}
 
 		enum video_range_type range =
@@ -543,6 +610,11 @@ static void spancam_stream_once(struct spancam_source *ctx)
 		obs_log(LOG_WARNING, "Spancam: bad or missing stream header (%s)", label);
 		goto done;
 	}
+	// flags bit0 seeds mirror at connect time; the live type-3 packet that follows
+	// is the actual source of truth for both mirror and rotation.
+	pthread_mutex_lock(&ctx->cfg_lock);
+	ctx->mirror = hdr[5] & 1;
+	pthread_mutex_unlock(&ctx->cfg_lock);
 	uint8_t codec_byte = hdr[4];
 	if (!spancam_open_decoder(ctx, codec_byte))
 		goto done;
@@ -584,6 +656,14 @@ static void spancam_stream_once(struct spancam_source *ctx)
 			if (type == 2)
 				spancam_abr_observe(ctx, pts_us);
 			spancam_decode(ctx, payload, (int)size, pts_us);
+		} else if (type == 3 && size >= 2) {
+			// Transform: mirror + rotation, applied on this end. Written under
+			// the same lock the decode loop reads it with, so a change lands on
+			// the very next frame.
+			pthread_mutex_lock(&ctx->cfg_lock);
+			ctx->mirror = payload[0] & 1;
+			ctx->rotation = (payload[1] & 3) * 90;
+			pthread_mutex_unlock(&ctx->cfg_lock);
 		}
 	}
 	bfree(payload);
@@ -624,6 +704,7 @@ static void spancam_source_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "connection", SPANCAM_CONN_AUTO);
 	obs_data_set_default_int(settings, "port", SPANCAM_DEFAULT_PORT);
+	obs_data_set_default_int(settings, "rotation", 0);
 }
 
 static obs_properties_t *spancam_source_get_properties(void *data)
@@ -635,6 +716,12 @@ static obs_properties_t *spancam_source_get_properties(void *data)
 	obs_property_list_add_int(conn, obs_module_text("Spancam.Conn.Auto"), SPANCAM_CONN_AUTO);
 	obs_property_list_add_int(conn, obs_module_text("Spancam.Conn.Usb"), SPANCAM_CONN_USB);
 	obs_property_list_add_int(conn, obs_module_text("Spancam.Conn.Wifi"), SPANCAM_CONN_WIFI);
+	obs_property_t *rot = obs_properties_add_list(props, "rotation", obs_module_text("Spancam.Prop.Rotation"),
+						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(rot, "0°", 0);
+	obs_property_list_add_int(rot, "90°", 90);
+	obs_property_list_add_int(rot, "180°", 180);
+	obs_property_list_add_int(rot, "270°", 270);
 	obs_properties_add_text(props, "host", obs_module_text("Spancam.Prop.Host"), OBS_TEXT_DEFAULT);
 	obs_properties_add_int(props, "port", obs_module_text("Spancam.Prop.Port"), 1, 65535, 1);
 	obs_properties_add_text(props, "token", obs_module_text("Spancam.Prop.Token"), OBS_TEXT_DEFAULT);
@@ -651,6 +738,7 @@ static void spancam_source_update(void *data, obs_data_t *settings)
 	ctx->host = bstrdup(obs_data_get_string(settings, "host"));
 	ctx->token = bstrdup(obs_data_get_string(settings, "token"));
 	ctx->port = (int)obs_data_get_int(settings, "port");
+	ctx->rotation = (int)obs_data_get_int(settings, "rotation");
 	pthread_mutex_unlock(&ctx->cfg_lock);
 }
 
@@ -677,6 +765,7 @@ static void spancam_source_destroy(void *data)
 	pthread_mutex_destroy(&ctx->cfg_lock);
 	bfree(ctx->host);
 	bfree(ctx->token);
+	bfree(ctx->rotbuf);
 	bfree(ctx);
 }
 
