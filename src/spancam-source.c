@@ -392,6 +392,25 @@ static enum video_format spancam_obs_format(enum AVPixelFormat f)
 	}
 }
 
+// libavcodec's get_format callback, and VideoToolbox does not work without it.
+// Setting hw_device_ctx alone is not enough: the default callback only picks up
+// hardware pixel formats flagged METHOD_INTERNAL, and VT is METHOD_HW_DEVICE_CTX,
+// so it quietly chooses the software format instead. No error, no warning, frames
+// still arrive — just as YUV420P off the CPU decoder. Returning the VT format here
+// is what actually engages the hwaccel. Installed before avcodec_open2, since it
+// can be called during open.
+#if defined(__APPLE__)
+static enum AVPixelFormat spancam_get_format(struct AVCodecContext *avctx, const enum AVPixelFormat *fmts)
+{
+	UNUSED_PARAMETER(avctx);
+	for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
+		if (*p == AV_PIX_FMT_VIDEOTOOLBOX)
+			return AV_PIX_FMT_VIDEOTOOLBOX;
+	}
+	return fmts[0]; // VT not on offer — take the software format and carry on
+}
+#endif
+
 static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 {
 	enum AVCodecID id = (codec_byte == 1) ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
@@ -406,11 +425,13 @@ static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 #if defined(__APPLE__)
 	// Try VideoToolbox first. Best-effort throughout: any step failing falls
 	// through to the software open below, so a machine without VT — or a profile
-	// it won't take — still streams.
+	// it won't take — still streams. Ordering is load-bearing: create the device,
+	// set hw_device_ctx AND get_format, and only then avcodec_open2.
 	if (av_hwdevice_ctx_create(&ctx->hw_device_ctx, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0) == 0) {
 		ctx->ctx = avcodec_alloc_context3(ctx->codec);
 		if (ctx->ctx) {
 			ctx->ctx->hw_device_ctx = av_buffer_ref(ctx->hw_device_ctx);
+			ctx->ctx->get_format = spancam_get_format;
 			if (ctx->ctx->hw_device_ctx && avcodec_open2(ctx->ctx, ctx->codec, NULL) == 0) {
 				ctx->frame = av_frame_alloc();
 				ctx->sw_frame = av_frame_alloc();
