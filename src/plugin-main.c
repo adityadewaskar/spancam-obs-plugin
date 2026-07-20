@@ -19,6 +19,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>.
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#endif
+
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
@@ -27,6 +31,12 @@ extern struct obs_source_info spancam_source_info;
 
 bool obs_module_load(void)
 {
+#if defined(_WIN32)
+	// Winsock has to be initialised per process before any socket call. OBS
+	// itself already does this, but a plugin can't assume load order.
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
 	obs_register_source(&spancam_source_info);
 	obs_log(LOG_INFO, "Spancam plugin loaded (version %s)", PLUGIN_VERSION);
 	return true;
@@ -34,5 +44,8 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+#if defined(_WIN32)
+	WSACleanup();
+#endif
 	obs_log(LOG_INFO, "Spancam plugin unloaded");
 }

@@ -12,6 +12,9 @@ Frames are paced on the encoder's PTS rather than on arrival, so OBS's async
 buffer is the jitter buffer.
 
 Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
+
+Builds on macOS, Windows and Linux. The socket layer is BSD sockets with a small
+set of Winsock aliases at the top of this file.
 */
 
 #include <obs-module.h>
@@ -25,6 +28,22 @@ Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+
+// Sockets. Winsock is close enough to BSD sockets that a handful of aliases
+// covers the whole difference for what this file does.
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET spancam_socket_t;
+#define SPANCAM_BAD_SOCKET INVALID_SOCKET
+#define spancam_closesocket closesocket
+#define spancam_popen _popen
+#define spancam_pclose _pclose
+#define SPANCAM_ADB "adb.exe"
+#define SPANCAM_DEVNULL " 2>NUL"
+typedef int spancam_socklen_t;
+#define SPANCAM_SOCKOPT(p) ((const char *)(p))
+#else
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -32,6 +51,16 @@ Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+typedef int spancam_socket_t;
+#define SPANCAM_BAD_SOCKET (-1)
+#define spancam_closesocket close
+#define spancam_popen popen
+#define spancam_pclose pclose
+#define SPANCAM_ADB "adb"
+#define SPANCAM_DEVNULL " 2>/dev/null"
+typedef socklen_t spancam_socklen_t;
+#define SPANCAM_SOCKOPT(p) (p)
+#endif
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixfmt.h>
@@ -76,7 +105,7 @@ struct spancam_source {
 	int64_t ts_base_obs_ns;
 
 	// Upstream control channel (plugin -> phone). Single writer: the receive thread.
-	int ctrl_fd;                  // socket to send control frames on (-1 = none)
+	spancam_socket_t ctrl_fd;     // socket to send control frames on
 	int abr_target;               // bitrate the phone is currently being asked for
 	int abr_ceiling;              // StreamHeader bitrate — never ask for more than this
 	bool abr_base_set;
@@ -109,10 +138,22 @@ struct spancam_source {
 };
 
 // --------------------------------------------------------------------------
-// Socket helpers (POSIX for now; Windows will need winsock shims).
+// Socket helpers.
 // --------------------------------------------------------------------------
 
-static int spancam_connect(const char *host, int port)
+// "The read timed out / would block", which is the normal case on every recv
+// timeout tick and must not be mistaken for the connection dying.
+static bool spancam_would_block(void)
+{
+#if defined(_WIN32)
+	int e = WSAGetLastError();
+	return e == WSAEWOULDBLOCK || e == WSAETIMEDOUT || e == WSAEINTR;
+#else
+	return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+}
+
+static spancam_socket_t spancam_connect(const char *host, int port)
 {
 	char portstr[8];
 	snprintf(portstr, sizeof(portstr), "%d", port);
@@ -123,45 +164,53 @@ static int spancam_connect(const char *host, int port)
 
 	struct addrinfo *res = NULL;
 	if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res)
-		return -1;
+		return SPANCAM_BAD_SOCKET;
 
-	int fd = -1;
+	spancam_socket_t fd = SPANCAM_BAD_SOCKET;
 	for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
 		fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-		if (fd < 0)
+		if (fd == SPANCAM_BAD_SOCKET)
 			continue;
-		if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+		if (connect(fd, ai->ai_addr, (spancam_socklen_t)ai->ai_addrlen) == 0)
 			break;
-		close(fd);
-		fd = -1;
+		spancam_closesocket(fd);
+		fd = SPANCAM_BAD_SOCKET;
 	}
 	freeaddrinfo(res);
 
-	if (fd >= 0) {
+	if (fd != SPANCAM_BAD_SOCKET) {
 		// A read timeout lets the receive loop notice the stop signal even
 		// while the phone is silent.
+		// SO_RCVTIMEO wants a DWORD of milliseconds on Windows and a timeval
+		// everywhere else — the one socket option that isn't just a rename.
+#if defined(_WIN32)
+		DWORD tv = SPANCAM_RECV_TIMEOUT_MS;
+#else
 		struct timeval tv = {.tv_sec = SPANCAM_RECV_TIMEOUT_MS / 1000,
 				     .tv_usec = (SPANCAM_RECV_TIMEOUT_MS % 1000) * 1000};
-		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, SPANCAM_SOCKOPT(&tv), sizeof(tv));
 		// A 4K keyframe is a lot of bytes arriving at once; the default receive
 		// buffer makes the kernel drop window and the sender stall on it.
 		int rcvbuf = 256 * 1024;
-		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, SPANCAM_SOCKOPT(&rcvbuf), sizeof(rcvbuf));
+		int nodelay = 1;
+		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, SPANCAM_SOCKOPT(&nodelay), sizeof(nodelay));
 	}
 	return fd;
 }
 
 // Read exactly len bytes; returns true on success, false on EOF/error/stop.
-static bool spancam_read_full(struct spancam_source *ctx, int fd, uint8_t *buf, size_t len)
+static bool spancam_read_full(struct spancam_source *ctx, spancam_socket_t fd, uint8_t *buf, size_t len)
 {
 	size_t got = 0;
 	while (got < len) {
 		if (os_event_try(ctx->stop_signal) != EAGAIN)
 			return false;
-		ssize_t n = recv(fd, buf + got, len - got, 0);
+		int n = recv(fd, (char *)buf + got, (int)(len - got), 0);
 		if (n > 0) {
 			got += (size_t)n;
-		} else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+		} else if (n < 0 && spancam_would_block()) {
 			continue; // timeout tick — re-check stop, keep reading
 		} else {
 			return false; // EOF or hard error
@@ -189,16 +238,16 @@ static uint64_t be64(const uint8_t *p)
 // --------------------------------------------------------------------------
 static void spancam_send_control(struct spancam_source *ctx, uint32_t type, const uint8_t *payload, uint32_t len)
 {
-	if (ctx->ctrl_fd < 0)
+	if (ctx->ctrl_fd == SPANCAM_BAD_SOCKET)
 		return;
 	uint8_t hdr[8] = {
 		(uint8_t)(type >> 24), (uint8_t)(type >> 16), (uint8_t)(type >> 8), (uint8_t)type,
 		(uint8_t)(len >> 24),  (uint8_t)(len >> 16),  (uint8_t)(len >> 8),  (uint8_t)len,
 	};
-	if (send(ctx->ctrl_fd, hdr, sizeof(hdr), 0) < 0)
+	if (send(ctx->ctrl_fd, (const char *)hdr, (int)sizeof(hdr), 0) < 0)
 		return;
 	if (len > 0 && payload)
-		send(ctx->ctrl_fd, payload, len, 0);
+		send(ctx->ctrl_fd, (const char *)payload, (int)len, 0);
 }
 
 static void spancam_send_keyframe(struct spancam_source *ctx)
@@ -236,7 +285,7 @@ static void spancam_abr_observe(struct spancam_source *ctx, int64_t pts_us)
 	if (delay < 0)
 		delay = 0;
 	ctx->abr_delay_ewma_ns = (ctx->abr_delay_ewma_ns * 7 + delay) / 8;
-	if (ctx->ctrl_fd < 0 || ctx->abr_ceiling <= 0)
+	if (ctx->ctrl_fd == SPANCAM_BAD_SOCKET || ctx->abr_ceiling <= 0)
 		return;
 	if (now - ctx->abr_last_send_ns < 1000000000LL) // ~1 Hz
 		return;
@@ -263,19 +312,19 @@ static void spancam_abr_observe(struct spancam_source *ctx, int64_t pts_us)
 
 static void spancam_run(const char *cmd)
 {
-	FILE *f = popen(cmd, "r");
+	FILE *f = spancam_popen(cmd, "r");
 	if (!f)
 		return;
 	char buf[256];
 	while (fgets(buf, sizeof(buf), f)) {
 	} // drain
-	pclose(f);
+	spancam_pclose(f);
 }
 
 // True if `adb devices` lists at least one connected device.
 static bool spancam_adb_has_device(void)
 {
-	FILE *f = popen("adb devices 2>/dev/null", "r");
+	FILE *f = spancam_popen(SPANCAM_ADB " devices" SPANCAM_DEVNULL, "r");
 	if (!f)
 		return false;
 	char line[256];
@@ -284,7 +333,7 @@ static bool spancam_adb_has_device(void)
 		if (strstr(line, "\tdevice")) // "<serial>\tdevice"; skips the header line
 			found = true;
 	}
-	pclose(f);
+	spancam_pclose(f);
 	return found;
 }
 
@@ -296,26 +345,30 @@ static bool spancam_adb_has_device(void)
 static bool spancam_udp_discover(struct spancam_source *ctx, char *host, size_t hostsz, int *port, char *token,
 				 size_t toksz)
 {
-	int fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (fd < 0)
+	spancam_socket_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd == SPANCAM_BAD_SOCKET)
 		return false;
 	int yes = 1;
-	setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+	setsockopt(fd, SOL_SOCKET, SO_BROADCAST, SPANCAM_SOCKOPT(&yes), sizeof(yes));
+#if defined(_WIN32)
+	DWORD tv = 600;
+#else
 	struct timeval tv = {.tv_sec = 0, .tv_usec = 600000};
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, SPANCAM_SOCKOPT(&tv), sizeof(tv));
 
 	struct sockaddr_in to = {0};
 	to.sin_family = AF_INET;
 	to.sin_port = htons(SPANCAM_DISCOVERY_PORT);
 	to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-	sendto(fd, SPANCAM_PROBE, sizeof(SPANCAM_PROBE) - 1, 0, (struct sockaddr *)&to, sizeof(to));
+	sendto(fd, SPANCAM_PROBE, (int)sizeof(SPANCAM_PROBE) - 1, 0, (struct sockaddr *)&to, sizeof(to));
 
 	bool ok = false;
 	for (int tries = 0; tries < 4 && os_event_try(ctx->stop_signal) == EAGAIN; tries++) {
 		char buf[256];
 		struct sockaddr_in from = {0};
-		socklen_t flen = sizeof(from);
-		ssize_t n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &flen);
+		spancam_socklen_t flen = sizeof(from);
+		int n = recvfrom(fd, buf, (int)sizeof(buf) - 1, 0, (struct sockaddr *)&from, &flen);
 		if (n <= 0)
 			break;
 		buf[n] = 0;
@@ -326,14 +379,16 @@ static bool spancam_udp_discover(struct spancam_source *ctx, char *host, size_t 
 		for (char *p = strtok(buf, "|"); p && nf < 8; p = strtok(NULL, "|"))
 			fields[nf++] = p;
 		if (nf >= 4) {
-			snprintf(host, hostsz, "%s", inet_ntoa(from.sin_addr));
+			char ip[INET_ADDRSTRLEN] = {0};
+			inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+			snprintf(host, hostsz, "%s", ip);
 			*port = atoi(fields[2]);
 			snprintf(token, toksz, "%s", fields[3]);
 			ok = true;
 			break;
 		}
 	}
-	close(fd);
+	spancam_closesocket(fd);
 	return ok;
 }
 
@@ -674,8 +729,8 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 // then hands back both ::1 and 127.0.0.1 and spancam_connect tries each in turn,
 // so a machine whose IPv4 loopback has been remapped or removed still connects
 // over ::1. `adb forward` listens on both.
-static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toksz, char *label_out, size_t lblsz,
-			bool *used_usb)
+static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out, size_t toksz, char *label_out,
+				     size_t lblsz, bool *used_usb)
 {
 	pthread_mutex_lock(&ctx->cfg_lock);
 	int mode = ctx->connection;
@@ -684,7 +739,7 @@ static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toks
 	char *mtoken = bstrdup(ctx->token ? ctx->token : "");
 	pthread_mutex_unlock(&ctx->cfg_lock);
 
-	int fd = -1;
+	spancam_socket_t fd = SPANCAM_BAD_SOCKET;
 	token_out[0] = 0;
 	*used_usb = false;
 
@@ -694,10 +749,11 @@ static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toks
 	// ---- USB, if a phone is plugged in ----
 	if ((mode == SPANCAM_CONN_USB || (mode == SPANCAM_CONN_AUTO && !usb_cooling)) && spancam_adb_has_device()) {
 		char cmd[64];
-		snprintf(cmd, sizeof(cmd), "adb forward tcp:%d tcp:%d", SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
+		snprintf(cmd, sizeof(cmd), SPANCAM_ADB " forward tcp:%d tcp:%d", SPANCAM_DEFAULT_PORT,
+			 SPANCAM_DEFAULT_PORT);
 		spancam_run(cmd);
 		fd = spancam_connect("localhost", SPANCAM_DEFAULT_PORT);
-		if (fd >= 0) {
+		if (fd != SPANCAM_BAD_SOCKET) {
 			token_out[0] = 0; // tokenless on loopback
 			*used_usb = true;
 			snprintf(label_out, lblsz, "USB localhost:%d", SPANCAM_DEFAULT_PORT);
@@ -725,7 +781,7 @@ static int spancam_dial(struct spancam_source *ctx, char *token_out, size_t toks
 		}
 		if (resolved) {
 			fd = spancam_connect(host, port);
-			if (fd >= 0) {
+			if (fd != SPANCAM_BAD_SOCKET) {
 				snprintf(token_out, toksz, "%s", token);
 				snprintf(label_out, lblsz, "Wi-Fi %s:%d", host, port);
 			}
@@ -744,8 +800,8 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	char label[160] = {0};
 	bool used_usb = false;
 	bool got_stream = false; // a valid StreamHeader arrived => this path actually works
-	int fd = spancam_dial(ctx, token, sizeof(token), label, sizeof(label), &used_usb);
-	if (fd < 0)
+	spancam_socket_t fd = spancam_dial(ctx, token, sizeof(token), label, sizeof(label), &used_usb);
+	if (fd == SPANCAM_BAD_SOCKET)
 		return;
 	obs_log(LOG_INFO, "Spancam: connected (%s)", label);
 
@@ -753,7 +809,7 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	struct dstr hello;
 	dstr_init(&hello);
 	dstr_printf(&hello, "SPANCAM/1 k=%s\n", token);
-	send(fd, hello.array, hello.len, 0);
+	send(fd, hello.array, (int)hello.len, 0);
 	dstr_free(&hello);
 
 	uint8_t hdr[24];
@@ -830,9 +886,9 @@ done:
 	// ordinary disconnect reconnects straight back over USB.
 	if (used_usb && !got_stream)
 		ctx->usb_cooldown_until_ns = (int64_t)os_gettime_ns() + 8000000000LL; // 8 s
-	ctx->ctrl_fd = -1; // the control channel goes away with the connection
+	ctx->ctrl_fd = SPANCAM_BAD_SOCKET; // the control channel goes with the connection
 	spancam_close_decoder(ctx);
-	close(fd);
+	spancam_closesocket(fd);
 	// Tell OBS the source has no picture. Without this the async texture stays
 	// active and OBS keeps rendering the last frame it was given — forever. Pull
 	// the cable mid-stream and your face stays on the broadcast, frozen, with no
@@ -907,7 +963,7 @@ static void *spancam_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct spancam_source *ctx = bzalloc(sizeof(struct spancam_source));
 	ctx->source = source;
-	ctx->ctrl_fd = -1; // no control socket until a connection is live
+	ctx->ctrl_fd = SPANCAM_BAD_SOCKET; // no control socket until a connection is live
 	pthread_mutex_init(&ctx->cfg_lock, NULL);
 	os_event_init(&ctx->stop_signal, OS_EVENT_TYPE_MANUAL);
 	spancam_source_update(ctx, settings);
