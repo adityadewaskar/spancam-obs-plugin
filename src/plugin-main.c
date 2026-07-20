@@ -19,6 +19,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>.
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+
 #if defined(_WIN32)
 #include <winsock2.h>
 #endif
@@ -29,6 +32,27 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 /* src/spancam-source.c */
 extern struct obs_source_info spancam_source_info;
 
+// The plugin decodes with the libavcodec that OBS ships (obs-deps). That library
+// has no cross-major-version ABI promise, so a plugin compiled against major N
+// can crash in obscure ways when loaded next to a runtime major N±1 — which is
+// exactly what happens the day OBS bumps its FFmpeg. Compare the two majors at
+// load and say so plainly, rather than letting it turn into a mystery segfault in
+// a bug report. A mismatch is logged, not fatal: the common minor-version drift
+// is harmless, and refusing to load would be worse than a warning.
+static void spancam_check_ffmpeg(void)
+{
+	unsigned built = LIBAVCODEC_VERSION_MAJOR;
+	unsigned runtime = AV_VERSION_MAJOR(avcodec_version());
+	if (built != runtime) {
+		obs_log(LOG_WARNING,
+			"Spancam: built against libavcodec %u but OBS is running %u — "
+			"decode may misbehave; rebuild the plugin against this OBS version",
+			built, runtime);
+	} else {
+		obs_log(LOG_INFO, "Spancam: libavcodec %u (%s)", runtime, av_version_info());
+	}
+}
+
 bool obs_module_load(void)
 {
 #if defined(_WIN32)
@@ -37,6 +61,7 @@ bool obs_module_load(void)
 	WSADATA wsa;
 	WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
+	spancam_check_ffmpeg();
 	obs_register_source(&spancam_source_info);
 	obs_log(LOG_INFO, "Spancam plugin loaded (version %s)", PLUGIN_VERSION);
 	return true;
