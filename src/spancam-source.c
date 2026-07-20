@@ -5,10 +5,11 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 An OBS async video source fed by a Spancam phone over SDSP (docs/PROTOCOL.md).
 A worker thread owns the socket: connect, handshake, read the StreamHeader, then
-pump packets until the far end goes away, then reconnect.
+pump packets until the far end goes away, then reconnect. Each access unit goes
+to libavcodec (which OBS already ships via obs-deps) and the decoded planes go
+straight to obs_source_output_video — no swscale, OBS takes planar YUV as-is.
 
-No decoder yet — packets are read and dropped. This exists to prove the framing
-is right before libavcodec gets involved.
+Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
 */
 
 #include <obs-module.h>
@@ -30,6 +31,9 @@ is right before libavcodec gets involved.
 #include <arpa/inet.h>
 #include <netdb.h>
 
+#include <libavcodec/avcodec.h>
+#include <libavutil/pixfmt.h>
+
 #define SPANCAM_DEFAULT_PORT 8892
 #define SPANCAM_MAGIC 0x53504331u // 'SPC1'
 #define SPANCAM_RECONNECT_MS 1500
@@ -46,6 +50,11 @@ struct spancam_source {
 	char *host;
 	int port;
 	char *token;
+
+	// Decoder (rebuilt per connection from the StreamHeader codec byte).
+	const AVCodec *codec;
+	AVCodecContext *ctx;
+	AVFrame *frame;
 };
 
 // --------------------------------------------------------------------------
@@ -116,6 +125,102 @@ static uint64_t be64(const uint8_t *p)
 }
 
 // --------------------------------------------------------------------------
+// FFmpeg decode -> OBS.
+// --------------------------------------------------------------------------
+
+static enum video_format spancam_obs_format(enum AVPixelFormat f)
+{
+	switch (f) {
+	case AV_PIX_FMT_YUV420P:
+	case AV_PIX_FMT_YUVJ420P:
+		return VIDEO_FORMAT_I420;
+	case AV_PIX_FMT_NV12:
+		return VIDEO_FORMAT_NV12;
+	case AV_PIX_FMT_YUV444P:
+	case AV_PIX_FMT_YUVJ444P:
+		return VIDEO_FORMAT_I444;
+	default:
+		return VIDEO_FORMAT_NONE;
+	}
+}
+
+static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
+{
+	enum AVCodecID id = (codec_byte == 1) ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+	ctx->codec = avcodec_find_decoder(id);
+	if (!ctx->codec) {
+		obs_log(LOG_ERROR, "Spancam: no decoder for %s", codec_byte == 1 ? "HEVC" : "H.264");
+		return false;
+	}
+	ctx->ctx = avcodec_alloc_context3(ctx->codec);
+	if (!ctx->ctx)
+		return false;
+	if (avcodec_open2(ctx->ctx, ctx->codec, NULL) < 0) {
+		avcodec_free_context(&ctx->ctx);
+		return false;
+	}
+	ctx->frame = av_frame_alloc();
+	return ctx->frame != NULL;
+}
+
+static void spancam_close_decoder(struct spancam_source *ctx)
+{
+	if (ctx->frame)
+		av_frame_free(&ctx->frame);
+	if (ctx->ctx)
+		avcodec_free_context(&ctx->ctx);
+	ctx->codec = NULL;
+}
+
+// Feed one Annex-B access unit (or the codec config) to the decoder and emit
+// whatever frames come back out.
+static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int size, int64_t pts_us)
+{
+	if (!ctx->ctx)
+		return;
+
+	AVPacket *pkt = av_packet_alloc();
+	pkt->data = (uint8_t *)data;
+	pkt->size = size;
+	pkt->pts = pts_us;
+
+	int ret = avcodec_send_packet(ctx->ctx, pkt);
+	av_packet_free(&pkt);
+	if (ret < 0)
+		return;
+
+	while (avcodec_receive_frame(ctx->ctx, ctx->frame) == 0) {
+		AVFrame *f = ctx->frame;
+
+		enum video_format fmt = spancam_obs_format(f->format);
+		if (fmt == VIDEO_FORMAT_NONE) {
+			obs_log(LOG_WARNING, "Spancam: unsupported pixel format %d", f->format);
+			av_frame_unref(f);
+			continue;
+		}
+
+		struct obs_source_frame frame = {0};
+		frame.format = fmt;
+		frame.timestamp = os_gettime_ns();
+		frame.width = (uint32_t)f->width;
+		frame.height = (uint32_t)f->height;
+		for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+			frame.data[i] = f->data[i];
+			frame.linesize[i] = (uint32_t)f->linesize[i];
+		}
+
+		enum video_range_type range =
+			(f->color_range == AVCOL_RANGE_JPEG) ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+		frame.full_range = (range == VIDEO_RANGE_FULL);
+		video_format_get_parameters_for_format(VIDEO_CS_709, range, fmt, frame.color_matrix,
+						       frame.color_range_min, frame.color_range_max);
+
+		obs_source_output_video(ctx->source, &frame);
+		av_frame_unref(f);
+	}
+}
+
+// --------------------------------------------------------------------------
 // One connection: handshake, StreamHeader, packet pump.
 // --------------------------------------------------------------------------
 
@@ -149,16 +254,21 @@ static void spancam_stream_once(struct spancam_source *ctx)
 		obs_log(LOG_WARNING, "Spancam: bad or missing stream header");
 		goto done;
 	}
+	uint8_t codec_byte = hdr[4];
+	if (!spancam_open_decoder(ctx, codec_byte))
+		goto done;
 	obs_log(LOG_INFO, "Spancam: stream %ux%u %s @ %u fps", be32(hdr + 8), be32(hdr + 12),
-		hdr[4] == 1 ? "HEVC" : "H.264", be32(hdr + 16));
+		codec_byte == 1 ? "HEVC" : "H.264", be32(hdr + 16));
 
-	// Packet pump. Payloads are read and dropped until there is a decoder.
+	// Packet pump.
 	size_t cap = 1 << 20;
 	uint8_t *payload = bmalloc(cap);
 	for (;;) {
 		uint8_t ph[16];
 		if (!spancam_read_full(ctx, fd, ph, sizeof(ph)))
 			break;
+		uint8_t type = ph[0];
+		int64_t pts_us = (int64_t)be64(ph + 4);
 		uint32_t size = be32(ph + 12);
 		if (size == 0 || size > (64u << 20)) // sanity cap 64 MiB
 			break;
@@ -168,10 +278,13 @@ static void spancam_stream_once(struct spancam_source *ctx)
 		}
 		if (!spancam_read_full(ctx, fd, payload, size))
 			break;
+		if (type == 1 || type == 2) // config and frames both go to the decoder
+			spancam_decode(ctx, payload, (int)size, pts_us);
 	}
 	bfree(payload);
 
 done:
+	spancam_close_decoder(ctx);
 	close(fd);
 	bfree(host);
 	bfree(token);

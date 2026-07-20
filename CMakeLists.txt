@@ -16,6 +16,14 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
+# FFmpeg, for the H.264/HEVC decode. obs-deps ships libavcodec/libavutil and the
+# template puts obs-deps on CMAKE_PREFIX_PATH, so find_library resolves them.
+find_library(SPANCAM_AVCODEC avcodec REQUIRED)
+find_library(SPANCAM_AVUTIL avutil REQUIRED)
+find_path(SPANCAM_FFMPEG_INCLUDE libavcodec/avcodec.h REQUIRED)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${SPANCAM_FFMPEG_INCLUDE})
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${SPANCAM_AVCODEC} ${SPANCAM_AVUTIL})
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
