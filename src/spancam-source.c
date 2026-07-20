@@ -108,15 +108,15 @@ struct spancam_source {
 	int64_t ts_base_obs_ns;
 
 	// Upstream control channel (plugin -> phone). Single writer: the receive thread.
-	spancam_socket_t ctrl_fd;     // socket to send control frames on
-	int abr_target;               // bitrate the phone is currently being asked for
-	int abr_ceiling;              // StreamHeader bitrate — never ask for more than this
+	spancam_socket_t ctrl_fd; // socket to send control frames on
+	int abr_target;           // bitrate the phone is currently being asked for
+	int abr_ceiling;          // StreamHeader bitrate — never ask for more than this
 	bool abr_base_set;
-	int64_t abr_base_arrival_ns;  // anchor for the one-way delay measurement
+	int64_t abr_base_arrival_ns; // anchor for the one-way delay measurement
 	int64_t abr_base_pts_us;
-	int64_t abr_delay_ewma_ns;    // smoothed queuing delay since the anchor
-	int64_t abr_last_send_ns;     // rate-limit control frames to ~1 Hz
-	int64_t last_kf_request_ns;   // debounce keyframe requests — no IDR storms
+	int64_t abr_delay_ewma_ns;  // smoothed queuing delay since the anchor
+	int64_t abr_last_send_ns;   // rate-limit control frames to ~1 Hz
+	int64_t last_kf_request_ns; // debounce keyframe requests — no IDR storms
 
 	// Auto-mode USB cooldown. A USB connection that CONNECTS but never produces a
 	// valid stream (flaky wireless-adb tunnel, a forward pointing at the wrong
@@ -706,15 +706,15 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 				}
 				uint8_t *dy = ctx->rotbuf, *duv = dy + ysz;
 				spancam_xform_plane(f->data[0], w, h, f->linesize[0], dy, ow, rot, mir, 1);
-				spancam_xform_plane(f->data[1], w / 2, h / 2, f->linesize[1] / 2, duv, ow / 2, rot,
-						    mir, 2);
+				spancam_xform_plane(f->data[1], w / 2, h / 2, f->linesize[1] / 2, duv, ow / 2, rot, mir,
+						    2);
 				frame.width = (uint32_t)ow;
 				frame.height = (uint32_t)oh;
 				frame.data[0] = dy;
 				frame.linesize[0] = (uint32_t)ow;
 				frame.data[1] = duv;
 				frame.linesize[1] = (uint32_t)ow; // (ow/2 pairs) * 2 bytes per row
-			} else { // I420, the software-decode path
+			} else {                                  // I420, the software-decode path
 				size_t ysz = (size_t)ow * oh, csz = (size_t)(ow / 2) * (oh / 2);
 				size_t need = ysz + 2 * csz;
 				if (need > ctx->rotcap) {
@@ -743,8 +743,8 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 			}
 		}
 
-		enum video_range_type range =
-			(f->color_range == AVCOL_RANGE_JPEG) ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+		enum video_range_type range = (f->color_range == AVCOL_RANGE_JPEG) ? VIDEO_RANGE_FULL
+										   : VIDEO_RANGE_PARTIAL;
 		frame.full_range = (range == VIDEO_RANGE_FULL);
 		video_format_get_parameters_for_format(VIDEO_CS_709, range, fmt, frame.color_matrix,
 						       frame.color_range_min, frame.color_range_max);
@@ -807,7 +807,7 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 			mode == SPANCAM_CONN_USB ? "" : " — falling back to Wi-Fi");
 		if (mode == SPANCAM_CONN_USB)
 			goto done; // USB-only: do not fall back
-		// Auto: fall through to Wi-Fi below.
+				   // Auto: fall through to Wi-Fi below.
 	}
 
 	// ---- Wi-Fi: a typed-in host wins, otherwise go looking ----
@@ -872,7 +872,7 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	got_stream = true;
 	if (used_usb)
 		ctx->usb_cooldown_until_ns = 0; // USB delivered — keep preferring it
-	ctx->ts_base_set = false; // re-anchor the pacing grid for this connection
+	ctx->ts_base_set = false;               // re-anchor the pacing grid for this connection
 	// Ask for a clean IDR straight away: the phone runs a long GOP, so joining
 	// mid-stream otherwise shows nothing at all until the next scheduled keyframe.
 	ctx->ctrl_fd = fd;
