@@ -35,6 +35,7 @@ Decode path follows obs-studio's own plugins/win-dshow/ffmpeg-decode.c.
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/hwcontext.h> // VideoToolbox decode, via the generic hwaccel API
 
 #define SPANCAM_DEFAULT_PORT 8892
 #define SPANCAM_DISCOVERY_PORT 8891
@@ -98,6 +99,13 @@ struct spancam_source {
 	const AVCodec *codec;
 	AVCodecContext *ctx;
 	AVFrame *frame;
+
+	// VideoToolbox decode on macOS. hw_decode = false means the pure software
+	// path, either because this isn't Apple or because some step below failed and
+	// we fell back. sw_frame is the reusable NV12 download target.
+	AVBufferRef *hw_device_ctx;
+	AVFrame *sw_frame;
+	bool hw_decode;
 };
 
 // --------------------------------------------------------------------------
@@ -392,6 +400,39 @@ static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 		obs_log(LOG_ERROR, "Spancam: no decoder for %s", codec_byte == 1 ? "HEVC" : "H.264");
 		return false;
 	}
+
+	ctx->hw_decode = false;
+
+#if defined(__APPLE__)
+	// Try VideoToolbox first. Best-effort throughout: any step failing falls
+	// through to the software open below, so a machine without VT — or a profile
+	// it won't take — still streams.
+	if (av_hwdevice_ctx_create(&ctx->hw_device_ctx, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0) == 0) {
+		ctx->ctx = avcodec_alloc_context3(ctx->codec);
+		if (ctx->ctx) {
+			ctx->ctx->hw_device_ctx = av_buffer_ref(ctx->hw_device_ctx);
+			if (ctx->ctx->hw_device_ctx && avcodec_open2(ctx->ctx, ctx->codec, NULL) == 0) {
+				ctx->frame = av_frame_alloc();
+				ctx->sw_frame = av_frame_alloc();
+				if (ctx->frame && ctx->sw_frame) {
+					ctx->hw_decode = true;
+					obs_log(LOG_INFO, "Spancam: VideoToolbox decode enabled");
+					return true;
+				}
+				if (ctx->frame)
+					av_frame_free(&ctx->frame);
+				if (ctx->sw_frame)
+					av_frame_free(&ctx->sw_frame);
+			}
+			avcodec_free_context(&ctx->ctx); // also drops the ref'd device copy
+		}
+		av_buffer_unref(&ctx->hw_device_ctx);
+		obs_log(LOG_INFO, "Spancam: VideoToolbox unavailable — using software decode");
+	}
+#endif
+
+	// Software path. Allocate a fresh context so a half-configured HW one is
+	// never reused.
 	ctx->ctx = avcodec_alloc_context3(ctx->codec);
 	if (!ctx->ctx)
 		return false;
@@ -405,11 +446,17 @@ static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 
 static void spancam_close_decoder(struct spancam_source *ctx)
 {
+	// Order: frames, then the codec context (which drops libavcodec's ref on the
+	// device), then our own master ref.
 	if (ctx->frame)
 		av_frame_free(&ctx->frame);
+	if (ctx->sw_frame)
+		av_frame_free(&ctx->sw_frame);
 	if (ctx->ctx)
 		avcodec_free_context(&ctx->ctx);
+	av_buffer_unref(&ctx->hw_device_ctx); // NULL-safe
 	ctx->codec = NULL;
+	ctx->hw_decode = false;
 }
 
 // Feed one Annex-B access unit (or the codec config) to the decoder and emit
@@ -441,6 +488,23 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 
 	while (avcodec_receive_frame(ctx->ctx, ctx->frame) == 0) {
 		AVFrame *f = ctx->frame;
+
+		// With VideoToolbox the decoded surface lives on the GPU. Pull it down
+		// into the reusable sw_frame (leaving the format unset lets FFmpeg pick,
+		// which is NV12) and run the rest of the loop against that. A failed
+		// transfer drops this one frame rather than tearing the decoder down — an
+		// IOSurface hiccup shouldn't end the stream.
+		if (f->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+			av_frame_unref(ctx->sw_frame);
+			ctx->sw_frame->format = AV_PIX_FMT_NONE;
+			if (av_hwframe_transfer_data(ctx->sw_frame, f, 0) < 0) {
+				obs_log(LOG_WARNING, "Spancam: HW frame download failed");
+				av_frame_unref(f);
+				continue;
+			}
+			av_frame_unref(f);
+			f = ctx->sw_frame;
+		}
 
 		enum video_format fmt = spancam_obs_format(f->format);
 		if (fmt == VIDEO_FORMAT_NONE) {
