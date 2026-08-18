@@ -456,8 +456,22 @@ static void spancam_run(const char *cmd)
 	spancam_pclose(f);
 }
 
-// True if `adb devices` lists at least one connected device.
-static bool spancam_adb_has_device(void)
+// Find a device attached BY CABLE, writing its serial to serial_out.
+//
+// `adb devices` lists wireless devices too, and they are the whole problem: adb
+// over Wi-Fi forwards through adbd, so the connection still arrives on the
+// phone's 127.0.0.1 and the phone -- which infers the transport from the peer
+// address -- concludes "USB, cable, plenty of bandwidth" and commits the session
+// to its top rung (4K30 at ~25 Mbps on an S24 Ultra). Those bytes then cross the
+// same Wi-Fi as everything else, which delivers a fraction of it, so the sender's
+// 3-frame queue sheds continuously and re-keyframes, and queuing delay grows
+// without bound. Measured on wireless adb: 4K/24.9 Mbps advertised, 10 fps and
+// 6.3 Mbps delivered, ~3.1 s of accumulated delay.
+//
+// A cable serial is a plain device id; a wireless one is either an mDNS instance
+// ("adb-<serial>-xxxxx._adb-tls-connect._tcp") or "<ip>:<port>". Both contain a
+// character a cable serial never does, so the test is exact rather than a guess.
+static bool spancam_adb_usb_device(char *serial_out, size_t serialsz)
 {
 	const char *adb = spancam_adb_path();
 	if (!adb)
@@ -468,12 +482,25 @@ static bool spancam_adb_has_device(void)
 	if (!f)
 		return false;
 	char line[256];
-	bool found = false;
+	bool found = false, saw_wireless = false;
 	while (fgets(line, sizeof(line), f)) {
-		if (strstr(line, "\tdevice")) // "<serial>\tdevice"; skips the header line
+		char *tab = strstr(line, "\tdevice"); // "<serial>\tdevice"; skips the header
+		if (!tab)
+			continue;
+		*tab = 0;
+		if (strstr(line, "._tcp") || strchr(line, ':')) {
+			saw_wireless = true; // adb over Wi-Fi — not a cable
+			continue;
+		}
+		if (!found) {
+			snprintf(serial_out, serialsz, "%s", line);
 			found = true;
+		}
 	}
 	spancam_pclose(f);
+	if (!found && saw_wireless)
+		obs_log(LOG_INFO, "Spancam: adb sees only a WIRELESS device — that is not a cable, "
+				  "so USB is unavailable and Wi-Fi is the honest path");
 	return found;
 }
 
@@ -1028,11 +1055,15 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 	// In Auto, skip USB while it's benched (see usb_cooldown_until_ns).
 	bool usb_cooling = (mode == SPANCAM_CONN_AUTO) && (ctx->usb_cooldown_until_ns > (int64_t)os_gettime_ns());
 
-	// ---- USB, if a phone is plugged in ----
-	if ((mode == SPANCAM_CONN_USB || (mode == SPANCAM_CONN_AUTO && !usb_cooling)) && spancam_adb_has_device()) {
+	// ---- USB, if a phone is on the end of a CABLE ----
+	char adb_serial[128] = {0};
+	if ((mode == SPANCAM_CONN_USB || (mode == SPANCAM_CONN_AUTO && !usb_cooling)) &&
+	    spancam_adb_usb_device(adb_serial, sizeof(adb_serial))) {
 		char cmd[1160];
-		snprintf(cmd, sizeof(cmd), "\"%s\" forward tcp:%d tcp:%d" SPANCAM_DEVNULL, spancam_adb_path(),
-			 SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
+		// -s scopes the forward: with two devices attached an unscoped `adb forward`
+		// errors out or silently tunnels to the wrong phone.
+		snprintf(cmd, sizeof(cmd), "\"%s\" -s \"%s\" forward tcp:%d tcp:%d" SPANCAM_DEVNULL,
+			 spancam_adb_path(), adb_serial, SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
 		spancam_run(cmd);
 		fd = spancam_connect("localhost", SPANCAM_DEFAULT_PORT);
 		if (fd != SPANCAM_BAD_SOCKET) {
@@ -1052,7 +1083,8 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 		// whole session — the single most confusing failure this plugin had.
 		obs_log(LOG_WARNING, "Spancam: USB selected but %s — set Connection to Auto or Wi-Fi, "
 				     "or enable USB debugging and plug the phone in",
-			spancam_adb_path() ? "adb reports no device" : "adb was not found");
+			spancam_adb_path() ? "no phone is attached by CABLE (a wireless-adb device is not USB)"
+					   : "adb was not found");
 	}
 
 	// ---- Wi-Fi: a typed-in host wins, otherwise go looking ----
