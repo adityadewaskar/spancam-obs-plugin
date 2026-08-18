@@ -78,8 +78,18 @@ typedef socklen_t spancam_socklen_t;
 #define SPANCAM_DISCOVERY_PORT 8891
 #define SPANCAM_PROBE "SPANCAM-DISCOVER"
 #define SPANCAM_MAGIC 0x53504331u // 'SPC1'
-#define SPANCAM_RECONNECT_MS 1500
 #define SPANCAM_RECV_TIMEOUT_MS 500
+
+// Liveness + reconnect, mirroring the Mac receiver so both ends of the product
+// behave the same way when a link dies (MacEffectRunner + ConnectionCore).
+#define SPANCAM_HEADER_TIMEOUT_MS 5000 // silence after connect before we give up
+#define SPANCAM_STREAM_TIMEOUT_MS 3000 // silence mid-stream before the link is dead
+#define SPANCAM_DECODE_DEAD_SECS 5     // wire flowing, nothing decoding => rebuild
+// The Mac's paced redial ladder. Past the end we hold at the last rung rather
+// than stopping: the Mac can afford to stop because a Bonjour browse pushes the
+// phone back the moment it returns, and this plugin has no such push — it can
+// only find a phone by dialling. So the tail is a slow poll, not a dead end.
+#define SPANCAM_MAX_REDIALS 10
 
 // Connection mode (the "Connection" dropdown).
 // Announced in the handshake so the phone can show which computer connected.
@@ -107,8 +117,17 @@ struct spancam_source {
 	char *host;     // blank = find a phone by broadcast
 	int port;
 	char *token;
-	int rotation; // 0/90/180/270, applied here — the phone never resamples pixels
-	int mirror;   // 0/1 horizontal flip, composed with rotation
+	// Rotation has TWO independent sources and they must not share a variable.
+	// wire_* is what the phone reports (StreamHeader mirror seed + type-3), and it
+	// changes whenever the phone is turned. user_rotation is the dropdown, an
+	// OFFSET the user adds on top. They used to be one field, so whichever wrote
+	// last won: every type-3 (one per connect, i.e. every redial) zeroed the
+	// dropdown, and every settings edit — including just switching Connection to
+	// USB — slammed a correctly-rotated phone back to the stale dropdown value.
+	// That is why changing transport appeared to rotate the canvas.
+	int wire_rotation; // 0/90/180/270 from type-3
+	int wire_mirror;   // 0/1 from type-3 / header flags
+	int user_rotation; // 0/90/180/270 from the property, added on top
 
 	// Reusable output buffer for the flipped/rotated frame. Grown as needed.
 	uint8_t *rotbuf;
@@ -131,6 +150,15 @@ struct spancam_source {
 	int64_t abr_delay_ewma_ns;  // smoothed queuing delay since the anchor
 	int64_t abr_last_send_ns;   // rate-limit control frames to ~1 Hz
 	int64_t last_kf_request_ns; // debounce keyframe requests — no IDR storms
+
+	// Reconnect + liveness, mirroring the Mac receiver (MacEffectRunner's
+	// BLACK-STREAM WATCHDOG and ConnectionCore's paced redial ladder).
+	int redials;              // consecutive failed/short connections
+	uint64_t wire_packets;    // SDSP packets read off the socket this connection
+	uint64_t decoded_frames;  // frames actually emitted to OBS this connection
+	uint64_t wd_last_wire, wd_last_decoded;
+	int wd_dead_secs;         // consecutive seconds of wire-but-no-decode
+	int64_t wd_next_tick_ns;
 
 	// Auto-mode USB cooldown. A USB connection that CONNECTS but never produces a
 	// valid stream (flaky wireless-adb tunnel, a forward pointing at the wrong
@@ -214,21 +242,50 @@ static spancam_socket_t spancam_connect(const char *host, int port)
 		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, SPANCAM_SOCKOPT(&rcvbuf), sizeof(rcvbuf));
 		int nodelay = 1;
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, SPANCAM_SOCKOPT(&nodelay), sizeof(nodelay));
+		// Keepalive. A phone that dies without a FIN (airplane mode, out of AP
+		// range, battery death) otherwise leaves this socket open forever: recv
+		// just keeps timing out, and because the plugin sends nothing while idle
+		// the kernel has no outstanding data to time out either. Keepalive is off
+		// by default on Darwin and Windows, so it has to be asked for.
+		int ka = 1;
+		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, SPANCAM_SOCKOPT(&ka), sizeof(ka));
+#if defined(TCP_KEEPALIVE) && defined(__APPLE__)
+		int kidle = 5; // seconds idle before the first probe
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, SPANCAM_SOCKOPT(&kidle), sizeof(kidle));
+#elif defined(TCP_KEEPIDLE)
+		int kidle = 5, kintvl = 2, kcnt = 3;
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, SPANCAM_SOCKOPT(&kidle), sizeof(kidle));
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, SPANCAM_SOCKOPT(&kintvl), sizeof(kintvl));
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, SPANCAM_SOCKOPT(&kcnt), sizeof(kcnt));
+#endif
 	}
 	return fd;
 }
 
-// Read exactly len bytes; returns true on success, false on EOF/error/stop.
-static bool spancam_read_full(struct spancam_source *ctx, spancam_socket_t fd, uint8_t *buf, size_t len)
+// Read exactly len bytes, giving up after timeout_ms without a single byte of
+// progress. The deadline is the whole point: SO_RCVTIMEO here is only a tick so
+// the loop can notice the stop signal, so without an elapsed-time bound a peer
+// that goes silent WITHOUT closing (the common Wi-Fi death) parks this thread
+// forever — the caller never returns, the source is never blanked, and the
+// reconnect below never runs. Returns false on EOF, error, stop, or deadline.
+static bool spancam_read_full(struct spancam_source *ctx, spancam_socket_t fd, uint8_t *buf, size_t len,
+			      int timeout_ms)
 {
 	size_t got = 0;
+	int64_t last_progress = (int64_t)os_gettime_ns();
 	while (got < len) {
 		if (os_event_try(ctx->stop_signal) != EAGAIN)
 			return false;
 		int n = recv(fd, (char *)buf + got, (int)(len - got), 0);
 		if (n > 0) {
 			got += (size_t)n;
+			last_progress = (int64_t)os_gettime_ns();
 		} else if (n < 0 && spancam_would_block()) {
+			if ((int64_t)os_gettime_ns() - last_progress > (int64_t)timeout_ms * 1000000LL) {
+				obs_log(LOG_WARNING, "Spancam: no data for %d ms — treating the link as dead",
+					timeout_ms);
+				return false;
+			}
 			continue; // timeout tick — re-check stop, keep reading
 		} else {
 			return false; // EOF or hard error
@@ -328,6 +385,66 @@ static void spancam_abr_observe(struct spancam_source *ctx, int64_t pts_us)
 // a phone screen and type it into OBS.
 // --------------------------------------------------------------------------
 
+// Find adb. A Finder/Dock-launched OBS.app inherits launchd's PATH
+// (/usr/bin:/bin:/usr/sbin:/sbin), which contains no adb on any platform — not
+// Android Studio's, not either Homebrew prefix — so a bare `adb` through popen
+// exits 127 and USB looks like "no device plugged in". It works when OBS is
+// started from a terminal, which is why this never showed up in development.
+// Resolved once per process; NULL means genuinely not installed.
+static const char *spancam_adb_path(void)
+{
+	static char cached[1024];
+	static bool resolved = false;
+	if (resolved)
+		return cached[0] ? cached : NULL;
+	resolved = true;
+
+	char cands[8][1024];
+	int n = 0;
+	const char *env;
+#if defined(_WIN32)
+	if ((env = getenv("ANDROID_SDK_ROOT")))
+		snprintf(cands[n++], sizeof(cands[0]), "%s\\platform-tools\\adb.exe", env);
+	if ((env = getenv("ANDROID_HOME")))
+		snprintf(cands[n++], sizeof(cands[0]), "%s\\platform-tools\\adb.exe", env);
+	if ((env = getenv("LOCALAPPDATA")))
+		snprintf(cands[n++], sizeof(cands[0]), "%s\\Android\\Sdk\\platform-tools\\adb.exe", env);
+	snprintf(cands[n++], sizeof(cands[0]), "adb.exe"); // PATH, for a console launch
+#else
+	if ((env = getenv("ANDROID_SDK_ROOT")))
+		snprintf(cands[n++], sizeof(cands[0]), "%s/platform-tools/adb", env);
+	if ((env = getenv("ANDROID_HOME")))
+		snprintf(cands[n++], sizeof(cands[0]), "%s/platform-tools/adb", env);
+	if ((env = getenv("HOME")))
+		snprintf(cands[n++], sizeof(cands[0]), "%s/Library/Android/sdk/platform-tools/adb", env);
+	snprintf(cands[n++], sizeof(cands[0]), "/opt/homebrew/bin/adb");
+	snprintf(cands[n++], sizeof(cands[0]), "/usr/local/bin/adb");
+	snprintf(cands[n++], sizeof(cands[0]), "/usr/bin/adb");
+	snprintf(cands[n++], sizeof(cands[0]), "adb"); // PATH, for a terminal launch
+#endif
+
+	for (int i = 0; i < n; i++) {
+		char probe[1100];
+		snprintf(probe, sizeof(probe), "\"%s\" version" SPANCAM_DEVNULL, cands[i]);
+		FILE *f = spancam_popen(probe, "r");
+		if (!f)
+			continue;
+		char line[256];
+		bool got = fgets(line, sizeof(line), f) && strstr(line, "Android Debug Bridge");
+		while (fgets(line, sizeof(line), f)) {
+		}
+		spancam_pclose(f);
+		if (got) {
+			snprintf(cached, sizeof(cached), "%s", cands[i]);
+			obs_log(LOG_INFO, "Spancam: using adb at %s", cached);
+			return cached;
+		}
+	}
+	obs_log(LOG_WARNING, "Spancam: adb not found — USB needs Android Platform Tools "
+			     "(set ANDROID_SDK_ROOT, or install to ~/Library/Android/sdk)");
+	return NULL;
+}
+
 static void spancam_run(const char *cmd)
 {
 	FILE *f = spancam_popen(cmd, "r");
@@ -342,7 +459,12 @@ static void spancam_run(const char *cmd)
 // True if `adb devices` lists at least one connected device.
 static bool spancam_adb_has_device(void)
 {
-	FILE *f = spancam_popen(SPANCAM_ADB " devices" SPANCAM_DEVNULL, "r");
+	const char *adb = spancam_adb_path();
+	if (!adb)
+		return false;
+	char cmd[1100];
+	snprintf(cmd, sizeof(cmd), "\"%s\" devices" SPANCAM_DEVNULL, adb);
+	FILE *f = spancam_popen(cmd, "r");
 	if (!f)
 		return false;
 	char line[256];
@@ -795,9 +917,12 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 		}
 		frame.timestamp = (uint64_t)(ctx->ts_base_obs_ns + rel_ns);
 
+		// Compose the two sources at use time. The phone's live orientation still
+		// follows the device, and the dropdown still corrects a phone that reports
+		// wrong (or an iPhone, which reports 0 today) — neither erases the other.
 		pthread_mutex_lock(&ctx->cfg_lock);
-		int rot = ctx->rotation;
-		int mir = ctx->mirror;
+		int rot = (ctx->wire_rotation + ctx->user_rotation) % 360;
+		int mir = ctx->wire_mirror;
 		pthread_mutex_unlock(&ctx->cfg_lock);
 
 		if ((rot != 0 || mir) && f->width > 0 && f->height > 0 &&
@@ -862,6 +987,7 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 						       frame.color_range_min, frame.color_range_max);
 
 		obs_source_output_video(ctx->source, &frame);
+		ctx->decoded_frames++;
 		av_frame_unref(f);
 	}
 }
@@ -904,9 +1030,9 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 
 	// ---- USB, if a phone is plugged in ----
 	if ((mode == SPANCAM_CONN_USB || (mode == SPANCAM_CONN_AUTO && !usb_cooling)) && spancam_adb_has_device()) {
-		char cmd[64];
-		snprintf(cmd, sizeof(cmd), SPANCAM_ADB " forward tcp:%d tcp:%d", SPANCAM_DEFAULT_PORT,
-			 SPANCAM_DEFAULT_PORT);
+		char cmd[1160];
+		snprintf(cmd, sizeof(cmd), "\"%s\" forward tcp:%d tcp:%d" SPANCAM_DEVNULL, spancam_adb_path(),
+			 SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
 		spancam_run(cmd);
 		fd = spancam_connect("localhost", SPANCAM_DEFAULT_PORT);
 		if (fd != SPANCAM_BAD_SOCKET) {
@@ -920,6 +1046,13 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 		if (mode == SPANCAM_CONN_USB)
 			goto done; // USB-only: do not fall back
 				   // Auto: fall through to Wi-Fi below.
+	} else if (mode == SPANCAM_CONN_USB) {
+		// Explicit USB with no reachable adb device. This used to return with no
+		// log at all, so the source sat black and the OBS log said NOTHING for the
+		// whole session — the single most confusing failure this plugin had.
+		obs_log(LOG_WARNING, "Spancam: USB selected but %s — set Connection to Auto or Wi-Fi, "
+				     "or enable USB debugging and plug the phone in",
+			spancam_adb_path() ? "adb reports no device" : "adb was not found");
 	}
 
 	// ---- Wi-Fi: a typed-in host wins, otherwise go looking ----
@@ -974,14 +1107,14 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	dstr_free(&hello);
 
 	uint8_t hdr[24];
-	if (!spancam_read_full(ctx, fd, hdr, sizeof(hdr)) || be32(hdr) != SPANCAM_MAGIC) {
+	if (!spancam_read_full(ctx, fd, hdr, sizeof(hdr), SPANCAM_HEADER_TIMEOUT_MS) || be32(hdr) != SPANCAM_MAGIC) {
 		obs_log(LOG_WARNING, "Spancam: bad or missing stream header (%s)", label);
 		goto done;
 	}
 	// flags bit0 seeds mirror at connect time; the live type-3 packet that follows
 	// is the actual source of truth for both mirror and rotation.
 	pthread_mutex_lock(&ctx->cfg_lock);
-	ctx->mirror = hdr[5] & 1;
+	ctx->wire_mirror = hdr[5] & 1;
 	pthread_mutex_unlock(&ctx->cfg_lock);
 	uint8_t codec_byte = hdr[4];
 	if (!spancam_open_decoder(ctx, codec_byte))
@@ -990,6 +1123,10 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	if (used_usb)
 		ctx->usb_cooldown_until_ns = 0; // USB delivered — keep preferring it
 	ctx->ts_base_set = false;               // re-anchor the pacing grid for this connection
+	ctx->wire_packets = ctx->decoded_frames = 0;
+	ctx->wd_last_wire = ctx->wd_last_decoded = 0;
+	ctx->wd_dead_secs = 0;
+	ctx->wd_next_tick_ns = (int64_t)os_gettime_ns() + 1000000000LL;
 	// Ask for a clean IDR straight away: the phone runs a long GOP, so joining
 	// mid-stream otherwise shows nothing at all until the next scheduled keyframe.
 	ctx->ctrl_fd = fd;
@@ -1009,9 +1146,34 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	size_t cap = 1 << 20;
 	uint8_t *payload = bmalloc(cap + AV_INPUT_BUFFER_PADDING_SIZE);
 	for (;;) {
+		// BLACK-STREAM WATCHDOG, the Mac receiver's decodeWatchdogTick: packets
+		// arriving but zero frames coming out means the decode pipeline is wedged,
+		// and no amount of waiting fixes it. Wire-quiet is NOT this watchdog's
+		// business — the read deadline above owns that. Five sustained seconds
+		// cannot be a transient hiccup, so tear the connection down and let the
+		// redial rebuild the decoder from a clean slate.
+		int64_t wnow = (int64_t)os_gettime_ns();
+		if (wnow >= ctx->wd_next_tick_ns) {
+			ctx->wd_next_tick_ns = wnow + 1000000000LL;
+			bool wire_adv = ctx->wire_packets != ctx->wd_last_wire;
+			bool dec_adv = ctx->decoded_frames != ctx->wd_last_decoded;
+			ctx->wd_last_wire = ctx->wire_packets;
+			ctx->wd_last_decoded = ctx->decoded_frames;
+			if (dec_adv || !wire_adv)
+				ctx->wd_dead_secs = 0;
+			else if (++ctx->wd_dead_secs >= SPANCAM_DECODE_DEAD_SECS) {
+				obs_log(LOG_ERROR,
+					"Spancam: packets flowing but ZERO frames decoded for %d s — "
+					"decode pipeline dead, reconnecting",
+					ctx->wd_dead_secs);
+				break;
+			}
+		}
+
 		uint8_t ph[16];
-		if (!spancam_read_full(ctx, fd, ph, sizeof(ph)))
+		if (!spancam_read_full(ctx, fd, ph, sizeof(ph), SPANCAM_STREAM_TIMEOUT_MS))
 			break;
+		ctx->wire_packets++;
 		uint8_t type = ph[0];
 		int64_t pts_us = (int64_t)be64(ph + 4);
 		uint32_t size = be32(ph + 12);
@@ -1021,7 +1183,7 @@ static void spancam_stream_once(struct spancam_source *ctx)
 			cap = size;
 			payload = brealloc(payload, cap + AV_INPUT_BUFFER_PADDING_SIZE);
 		}
-		if (!spancam_read_full(ctx, fd, payload, size))
+		if (!spancam_read_full(ctx, fd, payload, size, SPANCAM_STREAM_TIMEOUT_MS))
 			break;
 		memset(payload + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 		if (type == 1 || type == 2) { // config and frames both go to the decoder
@@ -1033,8 +1195,8 @@ static void spancam_stream_once(struct spancam_source *ctx)
 			// the same lock the decode loop reads it with, so a change lands on
 			// the very next frame.
 			pthread_mutex_lock(&ctx->cfg_lock);
-			ctx->mirror = payload[0] & 1;
-			ctx->rotation = (payload[1] & 3) * 90;
+			ctx->wire_mirror = payload[0] & 1;
+			ctx->wire_rotation = (payload[1] & 3) * 90;
 			pthread_mutex_unlock(&ctx->cfg_lock);
 		}
 	}
@@ -1045,6 +1207,13 @@ done:
 	// for a while instead of spinning on a tunnel that connects and then says
 	// nothing. A USB connection that DID stream cleared the cooldown above, so an
 	// ordinary disconnect reconnects straight back over USB.
+	// A connection that produced frames resets the ladder: an ordinary disconnect
+	// after a good session must redial in ~1 s, not at whatever rung an earlier
+	// outage had climbed to.
+	if (ctx->decoded_frames > 0)
+		ctx->redials = 0;
+	else if (ctx->redials < SPANCAM_MAX_REDIALS)
+		ctx->redials++;
 	if (used_usb && !got_stream)
 		ctx->usb_cooldown_until_ns = (int64_t)os_gettime_ns() + 8000000000LL; // 8 s
 	ctx->ctrl_fd = SPANCAM_BAD_SOCKET; // the control channel goes with the connection
@@ -1058,12 +1227,32 @@ done:
 	obs_source_output_video(ctx->source, NULL);
 }
 
+// The Mac receiver's paced redial ladder: 1/6/12/24/48/60 s. A phone that is
+// simply gone should not be dialled at 1.5 s forever — that is a busy loop
+// against the void which, with a blocking connect, also keeps a thread hot and
+// (in Auto) re-runs `adb devices` every cycle. Anything that streamed resets to
+// the bottom rung, so a real blip still recovers in about a second.
+static int spancam_redial_ms(int redials)
+{
+	static const int ladder[] = {1000, 6000, 12000, 24000, 48000, 60000};
+	const int rungs = (int)(sizeof(ladder) / sizeof(ladder[0]));
+	if (redials < 0)
+		redials = 0;
+	return redials >= rungs ? ladder[rungs - 1] : ladder[redials];
+}
+
 static void *spancam_receive_loop(void *data)
 {
 	struct spancam_source *ctx = data;
 	while (os_event_try(ctx->stop_signal) == EAGAIN) {
 		spancam_stream_once(ctx);
-		os_event_timedwait(ctx->stop_signal, SPANCAM_RECONNECT_MS);
+		int wait = spancam_redial_ms(ctx->redials);
+		if (ctx->redials == SPANCAM_MAX_REDIALS)
+			obs_log(LOG_INFO,
+				"Spancam: %d redials with no video — backing off to %d s; "
+				"the phone is not reachable, check it is on this network and Discoverable",
+				ctx->redials, wait / 1000);
+		os_event_timedwait(ctx->stop_signal, wait);
 	}
 	return NULL;
 }
@@ -1097,7 +1286,7 @@ static obs_properties_t *spancam_source_get_properties(void *data)
 	obs_property_list_add_int(conn, obs_module_text("Spancam.Conn.Wifi"), SPANCAM_CONN_WIFI);
 	obs_property_t *rot = obs_properties_add_list(props, "rotation", obs_module_text("Spancam.Prop.Rotation"),
 						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(rot, "0°", 0);
+	obs_property_list_add_int(rot, "0° (follow phone)", 0);
 	obs_property_list_add_int(rot, "90°", 90);
 	obs_property_list_add_int(rot, "180°", 180);
 	obs_property_list_add_int(rot, "270°", 270);
@@ -1118,7 +1307,7 @@ static void spancam_source_update(void *data, obs_data_t *settings)
 	ctx->host = bstrdup(obs_data_get_string(settings, "host"));
 	ctx->token = bstrdup(obs_data_get_string(settings, "token"));
 	ctx->port = (int)obs_data_get_int(settings, "port");
-	ctx->rotation = (int)obs_data_get_int(settings, "rotation");
+	ctx->user_rotation = (int)obs_data_get_int(settings, "rotation");
 	pthread_mutex_unlock(&ctx->cfg_lock);
 
 	// Unbuffered by default. OBS's buffered async path holds frames in a queue up to
