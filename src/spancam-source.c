@@ -1130,11 +1130,20 @@ static void spancam_stream_once(struct spancam_source *ctx)
 		return;
 	obs_log(LOG_INFO, "Spancam: connected (%s)", label);
 
-	// Handshake: "SPANCAM/1 k=<token> app=OBS os=<os>\n". The token gates Wi-Fi
-	// access; app/os are optional and only let the phone show who connected.
+	// Handshake: "SPANCAM/1 k=<token> app=OBS os=<os> link=<usb|wifi>\n". The token
+	// gates Wi-Fi access; app/os only let the phone show who connected.
+	//
+	// `link` exists because the phone CANNOT work this out for itself. It infers the
+	// transport from the peer address, and `adb forward` always arrives on the
+	// phone's loopback whether adb is running over a cable or over Wi-Fi — so a
+	// wireless-adb tunnel looked like a cable, the phone committed to its 4K rung,
+	// and ~25 Mbps went out over Wi-Fi (measured: 10 fps, ~3 s of accumulating
+	// delay). This end knows the truth, because it resolved either a cable serial or
+	// a wireless one, so it simply says which. A sender that does not understand
+	// `link=` ignores it and keeps its old inference.
 	struct dstr hello;
 	dstr_init(&hello);
-	dstr_printf(&hello, "SPANCAM/1 k=%s app=OBS os=%s\n", token, SPANCAM_OS);
+	dstr_printf(&hello, "SPANCAM/1 k=%s app=OBS os=%s link=%s\n", token, SPANCAM_OS, used_usb ? "usb" : "wifi");
 	send(fd, hello.array, (int)hello.len, 0);
 	dstr_free(&hello);
 
