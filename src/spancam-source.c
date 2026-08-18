@@ -65,9 +65,25 @@ typedef socklen_t spancam_socklen_t;
 #define SPANCAM_SOCKOPT(p) (p)
 #endif
 
+// On macOS the decode path is VideoToolbox, not libavcodec. OBS bundles its own
+// FFmpeg, and a plugin that READS AVFrame/AVCodecContext fields is bound to the
+// exact major it was compiled against — FFmpeg only guarantees layout within a
+// major. Pinning cannot fix that for a plugin shipped to everyone: pin 32.x and
+// OBS 31.x users break, pin 31.x and the reverse. VideoToolbox is a stable system
+// framework, so the macOS build is correct on every OBS version, and it is the
+// same decoder the Spancam Mac app uses. Windows and Linux keep libavcodec.
+#if defined(__APPLE__)
+#define SPANCAM_USE_VTDEC 1
+#include "spancam-vtdec.h"
+// libavcodec lets its bitstream readers run a little past the end of the input, so
+// the read buffer carries this much zeroed slack. VideoToolbox has no such rule,
+// but keeping the same padding on both backends means one buffer-sizing rule.
+#define AV_INPUT_BUFFER_PADDING_SIZE 64
+#else
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixfmt.h>
-#include <libavutil/hwcontext.h> // VideoToolbox decode, via the generic hwaccel API
+#include <libavutil/hwcontext.h>
+#endif
 
 #if defined(__APPLE__)
 #include <dns_sd.h>     // Bonjour browse/resolve — finds the iOS sender (macOS system lib)
@@ -168,6 +184,9 @@ struct spancam_source {
 	// explicit USB mode never cools down, because the user asked for USB. (os_gettime_ns)
 	int64_t usb_cooldown_until_ns;
 
+#if defined(SPANCAM_USE_VTDEC)
+	spancam_vtdec_t *vtdec;
+#else
 	// Decoder (rebuilt per connection from the StreamHeader codec byte).
 	const AVCodec *codec;
 	AVCodecContext *ctx;
@@ -180,6 +199,7 @@ struct spancam_source {
 	AVFrame *sw_frame;
 	bool hw_decode;
 	enum AVPixelFormat hw_pix_fmt; // the format get_format must hold out for
+#endif
 };
 
 // --------------------------------------------------------------------------
@@ -698,6 +718,116 @@ static void spancam_wire_to_obs_transform(int rot, int mir, long *obs_rotation, 
 	*obs_rotation = mir ? ((180 - rot) + 360) % 360 : rot;
 }
 
+// One frame out to OBS. Both decode backends land here, so the geometry, colour
+// and pacing rules live in exactly one place.
+static void spancam_emit_frame(struct spancam_source *ctx, enum video_format fmt, int width, int height,
+			       const uint8_t *const *planes, const int *strides, bool full_range, int64_t pts_us)
+{
+	struct obs_source_frame frame = {0};
+	frame.format = fmt;
+
+	// Pace on the wire PTS laid onto a monotonic OBS timebase. Re-anchor on the
+	// first frame, on a PTS that goes backwards (the encoder restarted) and on a
+	// wild jump forwards, so a corrupt PTS cannot strand the source in the future
+	// with every later frame dropped as too old.
+	int64_t rel_ns = (pts_us - ctx->ts_base_pts_us) * 1000;
+	if (!ctx->ts_base_set || pts_us < ctx->ts_base_pts_us || rel_ns > 10000000000LL) {
+		ctx->ts_base_set = true;
+		ctx->ts_base_pts_us = pts_us;
+		ctx->ts_base_obs_ns = (int64_t)os_gettime_ns();
+		rel_ns = 0;
+	}
+	frame.timestamp = (uint64_t)(ctx->ts_base_obs_ns + rel_ns);
+
+	// Geometry is the GPU's job — see spancam_wire_to_obs_transform.
+	pthread_mutex_lock(&ctx->cfg_lock);
+	int rot = (ctx->wire_rotation + ctx->user_rotation) % 360;
+	int mir = ctx->wire_mirror;
+	pthread_mutex_unlock(&ctx->cfg_lock);
+	long obs_rotation = 0;
+	bool flip = false;
+	spancam_wire_to_obs_transform(rot, mir, &obs_rotation, &flip);
+	if (obs_rotation != ctx->applied_rotation) {
+		obs_source_set_async_rotation(ctx->source, obs_rotation);
+		ctx->applied_rotation = obs_rotation;
+	}
+	frame.flip = flip;
+	frame.width = (uint32_t)width;
+	frame.height = (uint32_t)height;
+	for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+		frame.data[i] = (uint8_t *)planes[i];
+		frame.linesize[i] = (uint32_t)strides[i];
+	}
+
+	enum video_range_type range = full_range ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+	frame.full_range = full_range;
+	video_format_get_parameters_for_format(VIDEO_CS_709, range, fmt, frame.color_matrix, frame.color_range_min,
+					       frame.color_range_max);
+
+	obs_source_output_video(ctx->source, &frame);
+	ctx->decoded_frames++;
+}
+
+#if defined(SPANCAM_USE_VTDEC)
+// ---------------------------------------------------------------- VideoToolbox
+
+static void spancam_vt_on_frame(void *opaque, const struct spancam_vtdec_frame *f)
+{
+	struct spancam_source *ctx = opaque;
+	const uint8_t *planes[MAX_AV_PLANES] = {0};
+	int strides[MAX_AV_PLANES] = {0};
+	for (int i = 0; i < f->plane_count && i < (int)MAX_AV_PLANES; i++) {
+		planes[i] = f->data[i];
+		strides[i] = f->linesize[i];
+	}
+	// We ask VideoToolbox for NV12 and it is what the hardware decoder produces,
+	// so this is the only format that can arrive.
+	spancam_emit_frame(ctx, VIDEO_FORMAT_NV12, f->width, f->height, planes, strides, f->full_range, f->pts_us);
+}
+
+// What this machine can decode and present. VideoToolbox is hardware-backed on
+// every Mac that can run OBS, so the only real question is how much the rest of
+// the pipeline can carry — and with rotation now on the GPU that is generous.
+static void spancam_probe_caps(uint32_t *max_w, uint32_t *max_h)
+{
+	static uint32_t cw = 0, ch = 0;
+	if (!cw) {
+		int cores = (int)os_get_logical_cores();
+		cw = cores >= 4 ? 3840 : 1920;
+		ch = cores >= 4 ? 2160 : 1080;
+		obs_log(LOG_INFO, "Spancam: decode caps %ux%u (VideoToolbox, %d cores)", cw, ch, cores);
+	}
+	*max_w = cw;
+	*max_h = ch;
+}
+
+static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
+{
+	ctx->vtdec = spancam_vtdec_create(codec_byte, spancam_vt_on_frame, ctx);
+	return ctx->vtdec != NULL;
+}
+
+static void spancam_close_decoder(struct spancam_source *ctx)
+{
+	if (ctx->vtdec) {
+		spancam_vtdec_destroy(ctx->vtdec);
+		ctx->vtdec = NULL;
+	}
+}
+
+// type 1 = parameter sets, type 2 = one access unit. Returns false when the frame
+// could not be decoded, which the caller answers with a keyframe request.
+static bool spancam_feed(struct spancam_source *ctx, uint8_t type, const uint8_t *data, int size, int64_t pts_us)
+{
+	if (!ctx->vtdec)
+		return false;
+	if (type == 1)
+		return spancam_vtdec_set_parameter_sets(ctx->vtdec, data, (size_t)size);
+	return spancam_vtdec_decode(ctx->vtdec, data, (size_t)size, pts_us);
+}
+
+#else
+// ---------------------------------------------------------------- libavcodec
 static enum video_format spancam_obs_format(enum AVPixelFormat f)
 {
 	switch (f) {
@@ -929,10 +1059,10 @@ static void spancam_close_decoder(struct spancam_source *ctx)
 
 // Feed one Annex-B access unit (or the codec config) to the decoder and emit
 // whatever frames come back out.
-static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int size, int64_t pts_us)
+static bool spancam_decode(struct spancam_source *ctx, const uint8_t *data, int size, int64_t pts_us)
 {
 	if (!ctx->ctx)
-		return;
+		return false;
 
 	AVPacket *pkt = av_packet_alloc();
 	pkt->data = (uint8_t *)data;
@@ -1036,6 +1166,13 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 		av_frame_unref(f);
 	}
 }
+
+static bool spancam_feed(struct spancam_source *ctx, uint8_t type, const uint8_t *data, int size, int64_t pts_us)
+{
+	UNUSED_PARAMETER(type); // libavcodec takes parameter sets through the same call
+	return spancam_decode(ctx, data, size, pts_us);
+}
+#endif // SPANCAM_USE_VTDEC
 
 // --------------------------------------------------------------------------
 // One connection: handshake, StreamHeader, packet pump.
@@ -1251,7 +1388,17 @@ static void spancam_stream_once(struct spancam_source *ctx)
 		if (type == 1 || type == 2) { // config and frames both go to the decoder
 			if (type == 2)
 				spancam_abr_observe(ctx, pts_us);
-			spancam_decode(ctx, payload, (int)size, pts_us);
+			if (!spancam_feed(ctx, type, payload, (int)size, pts_us)) {
+				// Decode error or desync: ask for a fresh IDR rather than showing
+				// smeared garbage until the next scheduled one. Debounced, because
+				// a corrupt burst is many failures in a row and one IDR each would
+				// bury a link that is already in trouble.
+				int64_t kfnow = (int64_t)os_gettime_ns();
+				if (kfnow - ctx->last_kf_request_ns > 500000000LL) {
+					ctx->last_kf_request_ns = kfnow;
+					spancam_send_keyframe(ctx);
+				}
+			}
 		} else if (type == 3 && size >= 2) {
 			// Transform: mirror + rotation, applied on this end. Written under
 			// the same lock the decode loop reads it with, so a change lands on

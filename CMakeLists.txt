@@ -24,7 +24,13 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 # FFmpeg, for the H.264/HEVC decode — the same components and finder obs-studio's
 # own win-dshow plugin uses.
 find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE FFmpeg::avcodec FFmpeg::avutil)
+if(OS_MACOS)
+  # No FFmpeg on macOS: the decode path is VideoToolbox, so the plugin carries no
+  # dependency on the libavcodec OBS happens to ship and loads correctly into any
+  # OBS version. See src/spancam-vtdec.c.
+else()
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE FFmpeg::avcodec FFmpeg::avutil)
+endif()
 
 # Winsock, for the sockets on Windows (BSD sockets need no extra link elsewhere).
 if(OS_WINDOWS)
@@ -35,7 +41,13 @@ if(OS_MACOS)
   # uses. Both are macOS system frameworks — nothing is vendored.
   find_library(IOKIT_FRAMEWORK IOKit REQUIRED)
   find_library(COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${IOKIT_FRAMEWORK} ${COREFOUNDATION_FRAMEWORK})
+  find_library(VIDEOTOOLBOX_FRAMEWORK VideoToolbox REQUIRED)
+  find_library(COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
+  find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
+  target_link_libraries(
+    ${CMAKE_PROJECT_NAME}
+    PRIVATE ${IOKIT_FRAMEWORK} ${COREFOUNDATION_FRAMEWORK} ${VIDEOTOOLBOX_FRAMEWORK} ${COREMEDIA_FRAMEWORK}
+            ${COREVIDEO_FRAMEWORK})
 endif()
 endif()
 
@@ -58,6 +70,7 @@ if(ENABLE_QT)
 endif()
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/spancam-source.c
-            src/spancam-aoa.c)
+            src/spancam-aoa.c
+            src/spancam-vtdec.c)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

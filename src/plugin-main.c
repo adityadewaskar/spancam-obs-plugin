@@ -19,8 +19,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>.
 #include <obs-module.h>
 #include <plugin-support.h>
 
+#if !defined(__APPLE__)
 #include <libavcodec/avcodec.h>
+#endif
+#if !defined(__APPLE__)
 #include <libavutil/avutil.h>
+#endif
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -32,13 +36,17 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 /* src/spancam-source.c */
 extern struct obs_source_info spancam_source_info;
 
-// The plugin decodes with the libavcodec that OBS ships (obs-deps). That library
-// has no cross-major-version ABI promise, so a plugin compiled against major N
-// can crash in obscure ways when loaded next to a runtime major N±1 — which is
-// exactly what happens the day OBS bumps its FFmpeg. Compare the two majors at
-// load and say so plainly, rather than letting it turn into a mystery segfault in
-// a bug report. A mismatch is logged, not fatal: the common minor-version drift
-// is harmless, and refusing to load would be worse than a warning.
+// macOS decodes with VideoToolbox and links no FFmpeg at all, so there is nothing
+// to check there — which is the entire point of that backend. Windows and Linux
+// still decode with the libavcodec OBS ships, and that library has no
+// cross-major ABI promise: a plugin compiled against major N can misbehave in
+// obscure ways beside a runtime major N±1, which is exactly what happens the day
+// OBS bumps its FFmpeg. Compare the majors at load and say so plainly rather than
+// letting it become a mystery bug report. Logged, not fatal: minor drift is
+// harmless and refusing to load would be worse than a warning.
+#if defined(__APPLE__)
+static void spancam_check_ffmpeg(void) {}
+#else
 static void spancam_check_ffmpeg(void)
 {
 	unsigned built = LIBAVCODEC_VERSION_MAJOR;
@@ -52,6 +60,7 @@ static void spancam_check_ffmpeg(void)
 		obs_log(LOG_INFO, "Spancam: libavcodec %u (%s)", runtime, av_version_info());
 	}
 }
+#endif
 
 bool obs_module_load(void)
 {
