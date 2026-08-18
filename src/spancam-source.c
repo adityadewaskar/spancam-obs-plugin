@@ -718,9 +718,29 @@ static enum video_format spancam_obs_format(enum AVPixelFormat f)
 // LOW_DELAY tells the decoder not to hold frames back for reordering, which is
 // correct here because the phone encodes without B-frames — DTS equals PTS, so
 // there is nothing to reorder and any buffering is pure added latency.
-// FF_THREAD_SLICE rather than FF_THREAD_FRAME for the same reason: frame
-// threading wins throughput by working on several frames at once, and paying a
-// frame or more of latency for throughput is the wrong trade for a live camera.
+//
+// FF_THREAD_SLICE, and deliberately NOT FF_THREAD_FRAME. Measured, on 5575 frames
+// of real 720p off an S24 Ultra, decoding to null on an M4:
+//
+//     thread_type   threads   low_delay      time
+//     slice               1   on            7.17s
+//     slice               8   on            7.31s
+//     frame+slice         8   on            7.21s   <- no effect
+//     slice               8   off           7.15s   <- slice never parallelises
+//     frame+slice         8   off           1.90s   <- 3.8x, but only without low_delay
+//
+// Two things fall out. Slice threading gains nothing here at all, because
+// MediaCodec emits ONE SLICE PER PICTURE — no slice-size key, B-frames off — so
+// there is nothing to divide. And frame threading is mutually exclusive with
+// LOW_DELAY: asking for both silently gets neither, which is why adding
+// FF_THREAD_FRAME on its own was a no-op.
+//
+// So the real choice is latency against throughput, and low latency wins, because
+// the throughput problem is already solved upstream: spancam_probe_caps pins a
+// machine with no hardware decoder to 720p, and 720p decodes single-threaded at
+// ~775 fps here — still 75-150 fps on a machine five to ten times slower, i.e.
+// comfortably clear of 30. Buying 3.8x we do not need would cost up to N-1 frames
+// of pipeline (~230 ms at 30 fps with 8 threads) on a live camera.
 static void spancam_tune_decoder(AVCodecContext *c)
 {
 	c->flags |= AV_CODEC_FLAG_LOW_DELAY;
