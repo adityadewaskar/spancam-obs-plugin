@@ -29,6 +29,14 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE FFmpeg::avcodec FFmpeg::avut
 # Winsock, for the sockets on Windows (BSD sockets need no extra link elsewhere).
 if(OS_WINDOWS)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
+
+if(OS_MACOS)
+  # AOA (the cable path) goes through IOUSBLib, the same API the Spancam Mac app
+  # uses. Both are macOS system frameworks — nothing is vendored.
+  find_library(IOKIT_FRAMEWORK IOKit REQUIRED)
+  find_library(COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${IOKIT_FRAMEWORK} ${COREFOUNDATION_FRAMEWORK})
+endif()
 endif()
 
 if(ENABLE_FRONTEND_API)
@@ -49,6 +57,7 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/spancam-source.c)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/spancam-source.c
+            src/spancam-aoa.c)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
