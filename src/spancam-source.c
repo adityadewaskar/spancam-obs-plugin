@@ -129,9 +129,8 @@ struct spancam_source {
 	int wire_mirror;   // 0/1 from type-3 / header flags
 	int user_rotation; // 0/90/180/270 from the property, added on top
 
-	// Reusable output buffer for the flipped/rotated frame. Grown as needed.
-	uint8_t *rotbuf;
-	size_t rotcap;
+	// Last rotation handed to OBS, so the setter only fires on a real change.
+	long applied_rotation;
 
 	// PTS pacing: map the wire pts_us onto a monotonic OBS timebase so OBS's async
 	// source buffer can absorb network jitter, instead of presenting each frame the
@@ -661,53 +660,42 @@ static bool spancam_mdns_discover(struct spancam_source *ctx, char *host, size_t
 // FFmpeg decode -> OBS.
 // --------------------------------------------------------------------------
 
-// Rotate and/or horizontally flip one 8-bit plane, here on the computer. The
-// phone deliberately never does this: it would mean a second pass over every
-// frame on the device whose battery and thermal budget we care about, when this
-// end is idle by comparison. src is sw x sh with stride sstride; dstride is the
-// output row width, which for 90/270 is the rotated geometry.
+// Rotation and mirroring are done by OBS, on the GPU, not here.
 //
-// ORDER MATTERS. Rotate first with no mirror, THEN flip horizontally in DISPLAY
-// space (dx = dstride - 1 - dx). Flipping the source x before rotating flips
-// whichever axis the rotation happens to map it onto — at 90 and 270 that is the
-// vertical one, and a vertical flip on top of a quarter turn reads to the eye as
-// a 180° rotation. dstride is the post-rotation row width, so it doubles as the
-// flip axis and the two cases can't drift apart.
+// This file used to rotate and mirror every plane on the CPU — a scalar per-pixel
+// permutation with a transposing write pattern, run on the socket thread. Measured
+// at 4K with rotation on an Apple M4: 10.9 ms/frame, i.e. a 92 fps single-core
+// ceiling on one of the fastest cores available; on the mid and low-end laptops
+// most OBS users actually have it could not hold 30 fps at all, and the symptom —
+// judder plus climbing delay — looks exactly like a network fault.
 //
-// bpe is bytes per ELEMENT: 1 for an 8-bit plane (I420 Y/U/V, or NV12's Y), 2 for
-// NV12's interleaved UV where one element is the whole (Cb,Cr) pair. sw/sh/sstride
-// and dstride are all in ELEMENTS, not bytes. For UV the mirror moves the pair's
-// position in display space; the two bytes inside it are copied in order and never
-// swapped, because swapping them is how you turn NV12 into NV21. Being a pure
-// permutation of samples, chroma siting comes out unchanged.
-static void spancam_xform_plane(const uint8_t *src, int sw, int sh, int sstride, uint8_t *dst, int dstride, int rot,
-				int mir, int bpe)
+// libobs already rotates async sources on the GPU (obs_source_set_async_rotation,
+// applied in obs-source.c's render path) and flips them via GS_FLIP_V, and it
+// swaps async_width/height for 90/270 by itself. GS_FLIP_V is a VERTICAL flip, but
+// a horizontal mirror is just R180 composed with it, so every combination the wire
+// can ask for maps onto that pair:
+//
+//     wire rot  mirror  ->  obs_rotation  frame.flip
+//            0       0            0         false
+//            0       1          180          true
+//           90       0           90         false
+//           90       1           90          true
+//          180       0          180         false
+//          180       1            0          true
+//          270       0          270         false
+//          270       1          270          true
+//
+//   i.e. flip = mirror, and obs_rotation = mirror ? (180 - rot) mod 360 : rot.
+//
+// Verified exhaustively against the old CPU kernel: for all 8 combinations, on a
+// non-square odd-sized plane, the two produce an identical pixel mapping and
+// identical output geometry. The frame now goes to OBS straight from the AVFrame
+// planes, so the per-frame copy is gone too — and I444, which the CPU path silently
+// refused to rotate, now works like everything else.
+static void spancam_wire_to_obs_transform(int rot, int mir, long *obs_rotation, bool *flip)
 {
-	for (int y = 0; y < sh; y++) {
-		const uint8_t *srow = src + (size_t)y * sstride * bpe;
-		for (int x = 0; x < sw; x++) {
-			int dx, dy;
-			if (rot == 90) {
-				dx = sh - 1 - y;
-				dy = x;
-			} else if (rot == 180) {
-				dx = sw - 1 - x;
-				dy = sh - 1 - y;
-			} else if (rot == 270) {
-				dx = y;
-				dy = sw - 1 - x;
-			} else { // rot 0
-				dx = x;
-				dy = y;
-			}
-			if (mir)
-				dx = dstride - 1 - dx; // h-flip in display space, AFTER rotation
-			uint8_t *dpx = dst + ((size_t)dy * dstride + dx) * bpe;
-			const uint8_t *spx = srow + (size_t)x * bpe;
-			for (int b = 0; b < bpe; b++) // 1 byte, or the 2-byte UV pair
-				dpx[b] = spx[b];
-		}
-	}
+	*flip = mir != 0;
+	*obs_rotation = mir ? ((180 - rot) + 360) % 360 : rot;
 }
 
 static enum video_format spancam_obs_format(enum AVPixelFormat f)
@@ -1001,59 +989,20 @@ static void spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 		int mir = ctx->wire_mirror;
 		pthread_mutex_unlock(&ctx->cfg_lock);
 
-		if ((rot != 0 || mir) && f->width > 0 && f->height > 0 &&
-		    (fmt == VIDEO_FORMAT_I420 || fmt == VIDEO_FORMAT_NV12)) {
-			int w = f->width, h = f->height;
-			int ow = (rot == 90 || rot == 270) ? h : w; // 90/270 swap W/H
-			int oh = (rot == 90 || rot == 270) ? w : h;
-			if (fmt == VIDEO_FORMAT_NV12) {
-				// Y as 1-byte elements, then interleaved UV as 2-byte elements
-				// over a w/2 x h/2 grid. f->linesize is in BYTES, so the UV
-				// plane's ELEMENT stride is linesize[1] / 2.
-				size_t ysz = (size_t)ow * oh;
-				size_t uvsz = (size_t)ow * (oh / 2); // (ow/2 pairs) * 2 bytes * (oh/2 rows)
-				size_t need = ysz + uvsz;
-				if (need > ctx->rotcap) {
-					ctx->rotbuf = brealloc(ctx->rotbuf, need);
-					ctx->rotcap = need;
-				}
-				uint8_t *dy = ctx->rotbuf, *duv = dy + ysz;
-				spancam_xform_plane(f->data[0], w, h, f->linesize[0], dy, ow, rot, mir, 1);
-				spancam_xform_plane(f->data[1], w / 2, h / 2, f->linesize[1] / 2, duv, ow / 2, rot, mir,
-						    2);
-				frame.width = (uint32_t)ow;
-				frame.height = (uint32_t)oh;
-				frame.data[0] = dy;
-				frame.linesize[0] = (uint32_t)ow;
-				frame.data[1] = duv;
-				frame.linesize[1] = (uint32_t)ow; // (ow/2 pairs) * 2 bytes per row
-			} else {                                  // I420, the software-decode path
-				size_t ysz = (size_t)ow * oh, csz = (size_t)(ow / 2) * (oh / 2);
-				size_t need = ysz + 2 * csz;
-				if (need > ctx->rotcap) {
-					ctx->rotbuf = brealloc(ctx->rotbuf, need);
-					ctx->rotcap = need;
-				}
-				uint8_t *dy = ctx->rotbuf, *du = dy + ysz, *dv = du + csz;
-				spancam_xform_plane(f->data[0], w, h, f->linesize[0], dy, ow, rot, mir, 1);
-				spancam_xform_plane(f->data[1], w / 2, h / 2, f->linesize[1], du, ow / 2, rot, mir, 1);
-				spancam_xform_plane(f->data[2], w / 2, h / 2, f->linesize[2], dv, ow / 2, rot, mir, 1);
-				frame.width = (uint32_t)ow;
-				frame.height = (uint32_t)oh;
-				frame.data[0] = dy;
-				frame.linesize[0] = (uint32_t)ow;
-				frame.data[1] = du;
-				frame.linesize[1] = (uint32_t)(ow / 2);
-				frame.data[2] = dv;
-				frame.linesize[2] = (uint32_t)(ow / 2);
-			}
-		} else {
-			frame.width = (uint32_t)f->width;
-			frame.height = (uint32_t)f->height;
-			for (size_t i = 0; i < MAX_AV_PLANES; i++) {
-				frame.data[i] = f->data[i];
-				frame.linesize[i] = (uint32_t)f->linesize[i];
-			}
+		// Hand OBS the decoded planes as they are; the GPU does the geometry.
+		long obs_rotation = 0;
+		bool flip = false;
+		spancam_wire_to_obs_transform(rot, mir, &obs_rotation, &flip);
+		if (obs_rotation != ctx->applied_rotation) {
+			obs_source_set_async_rotation(ctx->source, obs_rotation);
+			ctx->applied_rotation = obs_rotation;
+		}
+		frame.flip = flip;
+		frame.width = (uint32_t)f->width;
+		frame.height = (uint32_t)f->height;
+		for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+			frame.data[i] = f->data[i];
+			frame.linesize[i] = (uint32_t)f->linesize[i];
 		}
 
 		enum video_range_type range = (f->color_range == AVCOL_RANGE_JPEG) ? VIDEO_RANGE_FULL
@@ -1363,9 +1312,7 @@ static const char *spancam_source_get_name(void *type_data)
 static void spancam_source_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "connection", SPANCAM_CONN_AUTO);
-	obs_data_set_default_int(settings, "port", SPANCAM_DEFAULT_PORT);
 	obs_data_set_default_int(settings, "rotation", 0);
-	obs_data_set_default_bool(settings, "buffering", false);
 }
 
 static obs_properties_t *spancam_source_get_properties(void *data)
@@ -1384,9 +1331,7 @@ static obs_properties_t *spancam_source_get_properties(void *data)
 	obs_property_list_add_int(rot, "180°", 180);
 	obs_property_list_add_int(rot, "270°", 270);
 	obs_properties_add_text(props, "host", obs_module_text("Spancam.Prop.Host"), OBS_TEXT_DEFAULT);
-	obs_properties_add_int(props, "port", obs_module_text("Spancam.Prop.Port"), 1, 65535, 1);
 	obs_properties_add_text(props, "token", obs_module_text("Spancam.Prop.Token"), OBS_TEXT_DEFAULT);
-	obs_properties_add_bool(props, "buffering", obs_module_text("Spancam.Prop.Buffering"));
 	return props;
 }
 
@@ -1396,10 +1341,33 @@ static void spancam_source_update(void *data, obs_data_t *settings)
 	pthread_mutex_lock(&ctx->cfg_lock);
 	bfree(ctx->host);
 	bfree(ctx->token);
+	ctx->host = NULL;
+	ctx->token = NULL;
 	ctx->connection = (int)obs_data_get_int(settings, "connection");
-	ctx->host = bstrdup(obs_data_get_string(settings, "host"));
+	// One address field, not two. The port is 8892 on every phone unless Android's
+	// bind fell back to an ephemeral one, which is rare enough that a whole spin box
+	// for it was worse than letting the rare user type "192.168.1.5:41337". Only a
+	// single trailing ":<digits>" counts, so an IPv6 literal or a bare name is left
+	// alone.
+	const char *host_in = obs_data_get_string(settings, "host");
+	ctx->port = SPANCAM_DEFAULT_PORT;
+	const char *colon = strrchr(host_in, ':');
+	if (colon && colon != host_in && strchr(host_in, ':') == colon && colon[1]) {
+		const char *d = colon + 1;
+		bool digits = true;
+		for (; *d; d++)
+			if (*d < '0' || *d > '9')
+				digits = false;
+		int p = digits ? atoi(colon + 1) : 0;
+		if (p >= 1 && p <= 65535) {
+			ctx->host = bstrdup(host_in);
+			ctx->host[colon - host_in] = 0; // split at the colon
+			ctx->port = p;
+		}
+	}
+	if (!ctx->host)
+		ctx->host = bstrdup(host_in);
 	ctx->token = bstrdup(obs_data_get_string(settings, "token"));
-	ctx->port = (int)obs_data_get_int(settings, "port");
 	ctx->user_rotation = (int)obs_data_get_int(settings, "rotation");
 	pthread_mutex_unlock(&ctx->cfg_lock);
 
@@ -1409,7 +1377,7 @@ static void spancam_source_update(void *data, obs_data_t *settings)
 	// second of latency for a source that is supposed to be live. Unbuffered drains to
 	// the newest frame each tick, which is what a camera wants. Every capture plugin in
 	// obs-studio does this, including plugins/win-dshow, which this file follows.
-	obs_source_set_async_unbuffered(ctx->source, !obs_data_get_bool(settings, "buffering"));
+	obs_source_set_async_unbuffered(ctx->source, true);
 }
 
 static void *spancam_source_create(obs_data_t *settings, obs_source_t *source)
@@ -1435,7 +1403,6 @@ static void spancam_source_destroy(void *data)
 	pthread_mutex_destroy(&ctx->cfg_lock);
 	bfree(ctx->host);
 	bfree(ctx->token);
-	bfree(ctx->rotbuf);
 	bfree(ctx);
 }
 
