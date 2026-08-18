@@ -788,6 +788,55 @@ static enum AVPixelFormat spancam_hw_pix_fmt(const AVCodec *codec, enum AVHWDevi
 	}
 }
 
+// What this computer can realistically DECODE AND TRANSFORM at 30 fps, declared to
+// the phone so it never picks a rung this end cannot keep up with.
+//
+// The phone alone cannot know this. It picks its rung from the transport, so a
+// cabled phone asks for its top rung — 4K30 on an S24 Ultra — and a mid-range
+// laptop then has to hardware-download 12.4 MB per frame and run a scalar
+// per-pixel rotate over it. Measured at 4K with rotation on an Apple M4: 10.9
+// ms/frame for the transform alone, i.e. a 92 fps single-core ceiling on one of
+// the fastest cores available. On the low-end laptops most OBS users actually
+// have, and with software decode, 4K30 cannot hold 30 fps at all — it presents as
+// judder and growing delay, which looks exactly like a network problem.
+//
+// The test is deliberately conservative: 4K only with a working hardware decoder
+// AND enough cores to absorb the transform; software decode is capped at 720p,
+// because software 4K H.264 is not a real-time proposition on this class of
+// machine. Probed once per process — opening a hw device is not free.
+static void spancam_probe_caps(uint32_t *max_w, uint32_t *max_h)
+{
+	static uint32_t cached_w = 0, cached_h = 0;
+	if (cached_w) {
+		*max_w = cached_w;
+		*max_h = cached_h;
+		return;
+	}
+	bool hw = false;
+	for (int i = 0; spancam_hw_types[i] != AV_HWDEVICE_TYPE_NONE && !hw; i++) {
+		AVBufferRef *probe = NULL;
+		if (av_hwdevice_ctx_create(&probe, spancam_hw_types[i], NULL, NULL, 0) == 0) {
+			hw = true;
+			av_buffer_unref(&probe);
+		}
+	}
+	int cores = (int)os_get_logical_cores();
+	if (hw && cores >= 8) {
+		cached_w = 3840;
+		cached_h = 2160;
+	} else if (hw || cores >= 8) {
+		cached_w = 1920;
+		cached_h = 1080;
+	} else {
+		cached_w = 1280;
+		cached_h = 720;
+	}
+	obs_log(LOG_INFO, "Spancam: decode caps %ux%u (hardware decode %s, %d cores)", cached_w, cached_h,
+		hw ? "available" : "NOT available", cores);
+	*max_w = cached_w;
+	*max_h = cached_h;
+}
+
 static bool spancam_open_decoder(struct spancam_source *ctx, uint8_t codec_byte)
 {
 	enum AVCodecID id = (codec_byte == 1) ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
@@ -1143,7 +1192,10 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	// `link=` ignores it and keeps its old inference.
 	struct dstr hello;
 	dstr_init(&hello);
-	dstr_printf(&hello, "SPANCAM/1 k=%s app=OBS os=%s link=%s\n", token, SPANCAM_OS, used_usb ? "usb" : "wifi");
+	uint32_t cap_w = 0, cap_h = 0;
+	spancam_probe_caps(&cap_w, &cap_h);
+	dstr_printf(&hello, "SPANCAM/1 k=%s app=OBS os=%s link=%s maxw=%u maxh=%u\n", token, SPANCAM_OS,
+		    used_usb ? "usb" : "wifi", cap_w, cap_h);
 	send(fd, hello.array, (int)hello.len, 0);
 	dstr_free(&hello);
 
