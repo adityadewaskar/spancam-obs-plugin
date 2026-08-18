@@ -1083,6 +1083,7 @@ static void spancam_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "connection", SPANCAM_CONN_AUTO);
 	obs_data_set_default_int(settings, "port", SPANCAM_DEFAULT_PORT);
 	obs_data_set_default_int(settings, "rotation", 0);
+	obs_data_set_default_bool(settings, "buffering", false);
 }
 
 static obs_properties_t *spancam_source_get_properties(void *data)
@@ -1103,6 +1104,7 @@ static obs_properties_t *spancam_source_get_properties(void *data)
 	obs_properties_add_text(props, "host", obs_module_text("Spancam.Prop.Host"), OBS_TEXT_DEFAULT);
 	obs_properties_add_int(props, "port", obs_module_text("Spancam.Prop.Port"), 1, 65535, 1);
 	obs_properties_add_text(props, "token", obs_module_text("Spancam.Prop.Token"), OBS_TEXT_DEFAULT);
+	obs_properties_add_bool(props, "buffering", obs_module_text("Spancam.Prop.Buffering"));
 	return props;
 }
 
@@ -1118,6 +1120,14 @@ static void spancam_source_update(void *data, obs_data_t *settings)
 	ctx->port = (int)obs_data_get_int(settings, "port");
 	ctx->rotation = (int)obs_data_get_int(settings, "rotation");
 	pthread_mutex_unlock(&ctx->cfg_lock);
+
+	// Unbuffered by default. OBS's buffered async path holds frames in a queue up to
+	// MAX_ASYNC_FRAMES (30) and paces them against its own clock -- a second delay on
+	// top of the PTS pacing this file already applies, which at 30 fps is up to a
+	// second of latency for a source that is supposed to be live. Unbuffered drains to
+	// the newest frame each tick, which is what a camera wants. Every capture plugin in
+	// obs-studio does this, including plugins/win-dshow, which this file follows.
+	obs_source_set_async_unbuffered(ctx->source, !obs_data_get_bool(settings, "buffering"));
 }
 
 static void *spancam_source_create(obs_data_t *settings, obs_source_t *source)
