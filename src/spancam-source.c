@@ -1166,6 +1166,8 @@ static bool spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 		ctx->decoded_frames++;
 		av_frame_unref(f);
 	}
+
+	return true;
 }
 
 static bool spancam_feed(struct spancam_source *ctx, uint8_t type, const uint8_t *data, int size, int64_t pts_us)
