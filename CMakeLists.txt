@@ -74,3 +74,18 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/spancam-sourc
             src/spancam-vtdec.c)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+if(OS_MACOS)
+  # Spancam icon on the .plugin bundle, shown in Finder inside the plugins folder.
+  target_add_resource(${CMAKE_PROJECT_NAME} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/resources/spancam.icns")
+  # Xcode's plist generator ignores INFOPLIST_KEY_CFBundleIconFile, so write the
+  # key directly (POST_BUILD runs before Xcode's implicit codesign step).
+  add_custom_command(
+    TARGET ${CMAKE_PROJECT_NAME}
+    POST_BUILD
+    COMMAND
+      /bin/sh -c
+      "/usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string spancam.icns' '$<TARGET_BUNDLE_CONTENT_DIR:${CMAKE_PROJECT_NAME}>/Info.plist' 2>/dev/null || /usr/libexec/PlistBuddy -c 'Set :CFBundleIconFile spancam.icns' '$<TARGET_BUNDLE_CONTENT_DIR:${CMAKE_PROJECT_NAME}>/Info.plist'"
+    VERBATIM
+  )
+endif()

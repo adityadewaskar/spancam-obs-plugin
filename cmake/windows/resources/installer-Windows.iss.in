@@ -30,6 +30,9 @@ Compression=lzma
 SolidCompression=yes
 DirExistsWarning=no
 WizardStyle=modern
+SetupIconFile="@CMAKE_CURRENT_SOURCE_DIR@/cmake/windows/resources/installer-icon.ico"
+WizardImageFile="@CMAKE_CURRENT_SOURCE_DIR@/cmake/windows/resources/installer-wizard.bmp"
+WizardSmallImageFile="@CMAKE_CURRENT_SOURCE_DIR@/cmake/windows/resources/installer-wizard-small.bmp"
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
