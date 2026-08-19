@@ -194,8 +194,7 @@ static bool create_session(struct spancam_vtdec *d)
 	const void *pf_keys[] = {kCVPixelBufferPixelFormatTypeKey};
 	SInt32 pf = src_full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
 			     : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-	obs_log(LOG_INFO, "Spancam: decode range = %s (from the stream's VUI)",
-		src_full ? "full" : "limited");
+	obs_log(LOG_INFO, "Spancam: decode range = %s (from the stream's VUI)", src_full ? "full" : "limited");
 	CFNumberRef pf_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pf);
 	const void *pf_vals[] = {pf_num};
 	CFDictionaryRef dest = CFDictionaryCreate(kCFAllocatorDefault, pf_keys, pf_vals, 1,
@@ -330,15 +329,15 @@ bool spancam_vtdec_decode(spancam_vtdec_t *d, const uint8_t *annexb, size_t len,
 	CMSampleTimingInfo timing = {.duration = kCMTimeInvalid,
 				     .presentationTimeStamp = CMTimeMake(pts_us, 1000000),
 				     .decodeTimeStamp = kCMTimeInvalid};
-	OSStatus st = CMSampleBufferCreateReady(kCFAllocatorDefault, block, d->fmt, 1, 1, &timing, 1, &sample_size,
-						&sample);
+	OSStatus st =
+		CMSampleBufferCreateReady(kCFAllocatorDefault, block, d->fmt, 1, 1, &timing, 1, &sample_size, &sample);
 	CFRelease(block);
 	if (st != noErr || !sample)
 		return false;
 
 	VTDecodeInfoFlags info = 0;
-	st = VTDecompressionSessionDecodeFrame(d->session, sample,
-					       kVTDecodeFrame_EnableAsynchronousDecompression, NULL, &info);
+	st = VTDecompressionSessionDecodeFrame(d->session, sample, kVTDecodeFrame_EnableAsynchronousDecompression, NULL,
+					       &info);
 	CFRelease(sample);
 	return st == noErr;
 }

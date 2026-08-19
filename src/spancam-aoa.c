@@ -177,8 +177,7 @@ static IOUSBDeviceInterface500 **open_device(io_service_t device, int32_t *out_k
 		return NULL;
 	}
 	IOUSBDeviceInterface500 **dev = NULL;
-	HRESULT res = (*plugin)->QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID500),
-						(LPVOID *)&dev);
+	HRESULT res = (*plugin)->QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID500), (LPVOID *)&dev);
 	IODestroyPlugInInterface(plugin);
 	if (res != 0 || !dev) {
 		*out_kr = -101;
@@ -331,8 +330,8 @@ spancam_aoa_t *spancam_aoa_open(char *err, size_t errsz)
 		return NULL;
 	}
 	IOUSBInterfaceInterface500 **intf = NULL;
-	HRESULT res = (*plugin)->QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID500),
-						(LPVOID *)&intf);
+	HRESULT res =
+		(*plugin)->QueryInterface(plugin, CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID500), (LPVOID *)&intf);
 	IODestroyPlugInInterface(plugin);
 	if (res != 0 || !intf) {
 		snprintf(err, errsz, "could not query the USB interface");

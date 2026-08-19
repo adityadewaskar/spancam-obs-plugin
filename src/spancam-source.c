@@ -178,9 +178,9 @@ struct spancam_source {
 	bool abr_base_set;
 	int64_t abr_base_arrival_ns; // anchor for the one-way delay measurement
 	int64_t abr_base_pts_us;
-	int64_t abr_delay_ewma_ns;  // smoothed queuing delay above the rolling baseline
-	int64_t abr_last_send_ns;   // when a control frame last went out
-	int64_t abr_last_tick_ns;   // when the loop last EVALUATED (~1 Hz)
+	int64_t abr_delay_ewma_ns; // smoothed queuing delay above the rolling baseline
+	int64_t abr_last_send_ns;  // when a control frame last went out
+	int64_t abr_last_tick_ns;  // when the loop last EVALUATED (~1 Hz)
 	// Rolling windowed-minimum skew, as two half-window buckets. The MINIMUM is the
 	// zero point: absolute skew is meaningless across two unrelated clocks, its growth
 	// is the queue. Never re-anchored to the current sample — that is what hid a
@@ -190,15 +190,15 @@ struct spancam_source {
 	int64_t abr_bucket_start_ns;
 	int64_t abr_cooldown_until_ns; // no increase before this (armed on every cut)
 	int abr_healthy_ticks;         // consecutive clear ticks (2 needed to climb)
-	int64_t last_kf_request_ns; // debounce keyframe requests — no IDR storms
+	int64_t last_kf_request_ns;    // debounce keyframe requests — no IDR storms
 
 	// Reconnect + liveness, mirroring the Mac receiver (MacEffectRunner's
 	// BLACK-STREAM WATCHDOG and ConnectionCore's paced redial ladder).
-	int redials;              // consecutive failed/short connections
-	uint64_t wire_packets;    // SDSP packets read off the socket this connection
-	uint64_t decoded_frames;  // frames actually emitted to OBS this connection
+	int redials;             // consecutive failed/short connections
+	uint64_t wire_packets;   // SDSP packets read off the socket this connection
+	uint64_t decoded_frames; // frames actually emitted to OBS this connection
 	uint64_t wd_last_wire, wd_last_decoded;
-	int wd_dead_secs;         // consecutive seconds of wire-but-no-decode
+	int wd_dead_secs; // consecutive seconds of wire-but-no-decode
 	int64_t wd_next_tick_ns;
 
 	// Auto-mode USB cooldown. A USB connection that CONNECTS but never produces a
@@ -333,8 +333,7 @@ static spancam_socket_t spancam_connect(const char *host, int port)
 // that goes silent WITHOUT closing (the common Wi-Fi death) parks this thread
 // forever — the caller never returns, the source is never blanked, and the
 // reconnect below never runs. Returns false on EOF, error, stop, or deadline.
-static bool spancam_read_full(struct spancam_source *ctx, spancam_socket_t fd, uint8_t *buf, size_t len,
-			      int timeout_ms)
+static bool spancam_read_full(struct spancam_source *ctx, spancam_socket_t fd, uint8_t *buf, size_t len, int timeout_ms)
 {
 	size_t got = 0;
 	int64_t last_progress = (int64_t)os_gettime_ns();
@@ -552,8 +551,7 @@ static const char *spancam_adb_path(void)
 
 	for (int i = 0; i < n; i++) {
 		char probe[1100];
-		snprintf(probe, sizeof(probe), "\"%.*s\" version" SPANCAM_DEVNULL,
-			 (int)sizeof(probe) - 32, cands[i]);
+		snprintf(probe, sizeof(probe), "\"%.*s\" version" SPANCAM_DEVNULL, (int)sizeof(probe) - 32, cands[i]);
 		FILE *f = spancam_popen(probe, "r");
 		if (!f)
 			continue;
@@ -988,7 +986,6 @@ static int spancam_enumerate_devices(struct spancam_source *ctx, struct spancam_
 #endif
 	return count;
 }
-
 
 // --------------------------------------------------------------------------
 // FFmpeg decode -> OBS.
@@ -1577,8 +1574,8 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 		char cmd[1160];
 		// -s scopes the forward: with two devices attached an unscoped `adb forward`
 		// errors out or silently tunnels to the wrong phone.
-		snprintf(cmd, sizeof(cmd), "\"%s\" -s \"%s\" forward tcp:%d tcp:%d" SPANCAM_DEVNULL,
-			 spancam_adb_path(), adb_serial, SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
+		snprintf(cmd, sizeof(cmd), "\"%s\" -s \"%s\" forward tcp:%d tcp:%d" SPANCAM_DEVNULL, spancam_adb_path(),
+			 adb_serial, SPANCAM_DEFAULT_PORT, SPANCAM_DEFAULT_PORT);
 		spancam_run(cmd);
 		fd = spancam_connect("localhost", SPANCAM_DEFAULT_PORT);
 		if (fd != SPANCAM_BAD_SOCKET) {
@@ -1596,8 +1593,9 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 		// Explicit USB with no reachable adb device. This used to return with no
 		// log at all, so the source sat black and the OBS log said NOTHING for the
 		// whole session — the single most confusing failure this plugin had.
-		obs_log(LOG_WARNING, "Spancam: USB selected but %s — set Connection to Auto or Wi-Fi, "
-				     "or enable USB debugging and plug the phone in",
+		obs_log(LOG_WARNING,
+			"Spancam: USB selected but %s — set Connection to Auto or Wi-Fi, "
+			"or enable USB debugging and plug the phone in",
 			spancam_adb_path() ? "no phone is attached by CABLE (a wireless-adb device is not USB)"
 					   : "adb was not found");
 	}
@@ -1770,8 +1768,7 @@ static void spancam_stream_once(struct spancam_source *ctx)
 			// Only while streaming over Wi-Fi in Auto, only every few seconds (each check
 			// forks adb), and only when a CABLE device is present — a wireless-adb device
 			// is not a cable and promoting to it would push the USB rung over Wi-Fi.
-			if (!used_usb && !promoted && mode_is_auto &&
-			    wnow >= ctx->usb_probe_next_ns) {
+			if (!used_usb && !promoted && mode_is_auto && wnow >= ctx->usb_probe_next_ns) {
 				ctx->usb_probe_next_ns = wnow + SPANCAM_USB_PROBE_NS;
 				char cable[128] = {0};
 				if (spancam_adb_usb_device(cable, sizeof(cable))) {
@@ -1924,8 +1921,7 @@ static void *spancam_receive_loop(void *data)
 			// transition so the OBS log explains a source that stopped on purpose.
 			if (!ctx->idled) {
 				ctx->idled = true;
-				obs_log(LOG_INFO,
-					"Spancam[%s]: source hidden — releasing the phone's camera",
+				obs_log(LOG_INFO, "Spancam[%s]: source hidden — releasing the phone's camera",
 					obs_source_get_name(ctx->source));
 			}
 			os_event_reset(ctx->wake);
@@ -2037,8 +2033,7 @@ static void spancam_fill_devices(struct spancam_source *ctx, obs_property_t *lis
 		dstr_free(&label);
 	}
 	obs_log(LOG_INFO, "Spancam[%s]: device scan found %d phone(s), pinned=\"%s\"%s",
-		obs_source_get_name(ctx->source), n, pinned,
-		(*pinned && !pinned_listed) ? " (not reachable)" : "");
+		obs_source_get_name(ctx->source), n, pinned, (*pinned && !pinned_listed) ? " (not reachable)" : "");
 	bfree(pinned);
 }
 
@@ -2072,10 +2067,10 @@ static obs_properties_t *spancam_source_get_properties(void *data)
 	// raced onto whichever phone answered first and then evicted each other forever,
 	// because each phone serves exactly one SDSP client.
 	obs_property_t *dev = obs_properties_add_list(props, "device", obs_module_text("Spancam.Prop.Device"),
-						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	spancam_fill_devices((struct spancam_source *)data, dev);
-	obs_properties_add_button2(props, "refresh", obs_module_text("Spancam.Prop.Refresh"),
-				   spancam_refresh_clicked, data);
+	obs_properties_add_button2(props, "refresh", obs_module_text("Spancam.Prop.Refresh"), spancam_refresh_clicked,
+				   data);
 
 	obs_property_t *conn = obs_properties_add_list(props, "connection", obs_module_text("Spancam.Prop.Connection"),
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
