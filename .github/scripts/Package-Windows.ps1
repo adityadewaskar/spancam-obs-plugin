@@ -93,8 +93,8 @@ function Package {
         try {
             Ensure-Location -Path "${ProjectRoot}/release"
 
-            # The .iss expects the installed plugin tree at "Package" relative to
-            # the release directory (see installer-Windows.iss.in).
+            # Stage the installed plugin tree at release/Package — the .iss
+            # references it by an absolute path baked in at CMake configure time.
             Copy-Item -Path ${Configuration} -Destination Package -Recurse
 
             Invoke-External $IsccPath ${IsccFile} /O"${ProjectRoot}/release" /F"${OutputName}-Installer"

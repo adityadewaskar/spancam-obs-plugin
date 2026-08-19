@@ -4,8 +4,10 @@
 ; OBS Studio application directory), no license screen (the GPL is not an EULA).
 ;
 ; Processed by CMake's configure_file into installer-Windows.generated.iss.
-; Package-Windows.ps1 copies release/<Config> to release/Package and runs iscc
-; from the release directory, so the [Files] source below is "Package\*".
+; Package-Windows.ps1 copies release/<Config> to release/Package and runs iscc.
+; NOTE: iscc resolves relative [Files] sources against the SCRIPT's directory
+; (build_x64), not the process working directory — so the source below is an
+; absolute path baked in by CMake.
 
 #define MyAppName "@CMAKE_PROJECT_NAME@"
 #define MyAppVersion "@CMAKE_PROJECT_VERSION@"
@@ -35,4 +37,4 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Files]
 ; "Package" is the copied release/<Config> tree, which contains the
 ; spancam-for-obs module folder (bin\64bit\spancam-for-obs.dll, data\...).
-Source: "Package\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "@CMAKE_CURRENT_SOURCE_DIR@/release/Package/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
