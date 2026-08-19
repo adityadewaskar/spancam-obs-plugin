@@ -27,11 +27,21 @@ extern "C" {
 #include <stdarg.h>
 #include <string.h>
 
+// blogva() comes from here, with the platform-correct linkage. Declaring it
+// ourselves collides with that declaration on Windows (MSVC C2375).
 extern const char *PLUGIN_NAME;
 extern const char *PLUGIN_VERSION;
 
 void obs_log(int log_level, const char *format, ...);
+
+// Declared here instead of including <util/base.h>, because the plugin-support
+// target has no OBS include dirs. The declaration must match base.h exactly —
+// on MSVC a plain extern collides with their __declspec(dllexport) (C2375).
+#ifdef _MSC_VER
+__declspec(dllexport) void blogva(int log_level, const char *format, va_list args);
+#else
 extern void blogva(int log_level, const char *format, va_list args);
+#endif
 
 #ifdef __cplusplus
 }

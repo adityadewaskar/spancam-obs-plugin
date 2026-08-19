@@ -444,7 +444,8 @@ static const char *spancam_adb_path(void)
 
 	for (int i = 0; i < n; i++) {
 		char probe[1100];
-		snprintf(probe, sizeof(probe), "\"%s\" version" SPANCAM_DEVNULL, cands[i]);
+		snprintf(probe, sizeof(probe), "\"%.*s\" version" SPANCAM_DEVNULL,
+			 (int)sizeof(probe) - 32, cands[i]);
 		FILE *f = spancam_popen(probe, "r");
 		if (!f)
 			continue;
@@ -454,7 +455,7 @@ static const char *spancam_adb_path(void)
 		}
 		spancam_pclose(f);
 		if (got) {
-			snprintf(cached, sizeof(cached), "%s", cands[i]);
+			snprintf(cached, sizeof(cached), "%.*s", (int)sizeof(cached) - 1, cands[i]);
 			obs_log(LOG_INFO, "Spancam: using adb at %s", cached);
 			return cached;
 		}
@@ -512,7 +513,7 @@ static bool spancam_adb_usb_device(char *serial_out, size_t serialsz)
 			continue;
 		}
 		if (!found) {
-			snprintf(serial_out, serialsz, "%s", line);
+			snprintf(serial_out, serialsz, "%.*s", (int)serialsz - 1, line);
 			found = true;
 		}
 	}
@@ -1081,7 +1082,7 @@ static bool spancam_decode(struct spancam_source *ctx, const uint8_t *data, int 
 			ctx->last_kf_request_ns = now;
 			spancam_send_keyframe(ctx);
 		}
-		return;
+		return false;
 	}
 
 	while (avcodec_receive_frame(ctx->ctx, ctx->frame) == 0) {
