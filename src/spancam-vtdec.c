@@ -171,8 +171,31 @@ static bool create_session(struct spancam_vtdec *d)
 
 	// NV12 out: it is what the hardware decoder produces natively and what OBS
 	// takes as VIDEO_FORMAT_NV12, so nothing converts anywhere.
+	//
+	// RANGE MUST FOLLOW THE SOURCE. This used to ask for VideoRange (limited)
+	// unconditionally, while the frame callback derives `full_range` from the pixel format
+	// that actually came back — so `full_range` could only ever be false, and a FULL-range
+	// stream was handed to OBS labelled limited. OBS then expands 16-235 over data that
+	// already used 0-255: crushed blacks and clipped highlights, on that phone only.
+	//
+	// Measured with ffprobe on real captures: the iPhone emits yuv420p (limited, the BT.709
+	// video default) and this Samsung emits yuvj420p / full range, so the two phones landed
+	// on opposite sides of the same bug and looked different from each other.
+	//
+	// The H.264/HEVC VUI's video_full_range_flag is surfaced on the format description as
+	// kCMFormatDescriptionExtension_FullRangeVideo, so ask for the pixel format that MATCHES
+	// the source. Then the callback's `full_range` is the truth for either kind of sender,
+	// and no range conversion happens in either direction.
+	bool src_full = false;
+	CFTypeRef fr = CMFormatDescriptionGetExtension(d->fmt, kCMFormatDescriptionExtension_FullRangeVideo);
+	if (fr && CFGetTypeID(fr) == CFBooleanGetTypeID())
+		src_full = CFBooleanGetValue((CFBooleanRef)fr);
+
 	const void *pf_keys[] = {kCVPixelBufferPixelFormatTypeKey};
-	SInt32 pf = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+	SInt32 pf = src_full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+			     : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+	obs_log(LOG_INFO, "Spancam: decode range = %s (from the stream's VUI)",
+		src_full ? "full" : "limited");
 	CFNumberRef pf_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pf);
 	const void *pf_vals[] = {pf_num};
 	CFDictionaryRef dest = CFDictionaryCreate(kCFAllocatorDefault, pf_keys, pf_vals, 1,
