@@ -90,11 +90,23 @@ typedef socklen_t spancam_socklen_t;
 #include <sys/select.h> // select() to pump the DNSServiceRef synchronously
 #endif
 
+// ABR tuning — mirrors mac/Spancam/Core/BitrateController.swift so both receivers
+// converge identically on the same link.
+#define SPANCAM_ABR_QUEUE_HIGH_NS 250000000LL  // >250 ms of queue => congested
+#define SPANCAM_ABR_QUEUE_LOW_NS 60000000LL    // <60 ms => clear
+#define SPANCAM_ABR_COOLDOWN_NS 3000000000LL   // 3 s after a cut before any climb
+#define SPANCAM_ABR_BASELINE_NS 20000000000LL  // 20 s windowed-min baseline
+#define SPANCAM_ABR_INCREASE_BPS 300000        // +300 kbps additive increase
+
 #define SPANCAM_DEFAULT_PORT 8892
 #define SPANCAM_DISCOVERY_PORT 8891
 #define SPANCAM_PROBE "SPANCAM-DISCOVER"
 #define SPANCAM_MAGIC 0x53504331u // 'SPC1'
 #define SPANCAM_RECV_TIMEOUT_MS 500
+// How often Auto looks for a newly-attached USB cable while streaming over Wi-Fi. Each
+// check forks adb, so this is a few seconds rather than every tick — fast enough that a
+// cable feels immediate, cheap enough to run for the whole session.
+#define SPANCAM_USB_PROBE_NS 2000000000LL
 
 // Liveness + reconnect, mirroring the Mac receiver so both ends of the product
 // behave the same way when a link dies (MacEffectRunner + ConnectionCore).
@@ -144,6 +156,10 @@ struct spancam_source {
 	int wire_rotation; // 0/90/180/270 from type-3
 	int wire_mirror;   // 0/1 from type-3 / header flags
 	int user_rotation; // 0/90/180/270 from the property, added on top
+	// The phone this source is PINNED to, by NAME (see struct spancam_device). Empty =
+	// "any", the old first-one-wins behaviour. Re-resolved on every dial so a rotated
+	// access token or a new DHCP lease heals itself.
+	char *device;
 
 	// Last rotation handed to OBS, so the setter only fires on a real change.
 	long applied_rotation;
@@ -162,8 +178,18 @@ struct spancam_source {
 	bool abr_base_set;
 	int64_t abr_base_arrival_ns; // anchor for the one-way delay measurement
 	int64_t abr_base_pts_us;
-	int64_t abr_delay_ewma_ns;  // smoothed queuing delay since the anchor
-	int64_t abr_last_send_ns;   // rate-limit control frames to ~1 Hz
+	int64_t abr_delay_ewma_ns;  // smoothed queuing delay above the rolling baseline
+	int64_t abr_last_send_ns;   // when a control frame last went out
+	int64_t abr_last_tick_ns;   // when the loop last EVALUATED (~1 Hz)
+	// Rolling windowed-minimum skew, as two half-window buckets. The MINIMUM is the
+	// zero point: absolute skew is meaningless across two unrelated clocks, its growth
+	// is the queue. Never re-anchored to the current sample — that is what hid a
+	// standing queue and made a draining one read as healthy.
+	int64_t abr_min_cur;
+	int64_t abr_min_prev;
+	int64_t abr_bucket_start_ns;
+	int64_t abr_cooldown_until_ns; // no increase before this (armed on every cut)
+	int abr_healthy_ticks;         // consecutive clear ticks (2 needed to climb)
 	int64_t last_kf_request_ns; // debounce keyframe requests — no IDR storms
 
 	// Reconnect + liveness, mirroring the Mac receiver (MacEffectRunner's
@@ -183,6 +209,12 @@ struct spancam_source {
 	// moment USB does yield a header, so USB stays the preference. Auto only —
 	// explicit USB mode never cools down, because the user asked for USB. (os_gettime_ns)
 	int64_t usb_cooldown_until_ns;
+	// Next time Auto may look for a USB cable to promote to (see the packet pump).
+	int64_t usb_probe_next_ns;
+	/// Set when the pump broke to promote to USB, so the loop redials at once.
+	bool promote_now;
+	/// Consecutive USB attempts that connected but never streamed. Backs off the probe.
+	int promote_fails;
 
 #if defined(SPANCAM_USE_VTDEC)
 	spancam_vtdec_t *vtdec;
@@ -215,6 +247,16 @@ static bool spancam_would_block(void)
 	return e == WSAEWOULDBLOCK || e == WSAETIMEDOUT || e == WSAEINTR;
 #else
 	return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+}
+
+// The raw socket error, for diagnostics.
+static int spancam_last_error(void)
+{
+#if defined(_WIN32)
+	return WSAGetLastError();
+#else
+	return errno;
 #endif
 }
 
@@ -307,6 +349,8 @@ static bool spancam_read_full(struct spancam_source *ctx, spancam_socket_t fd, u
 			}
 			continue; // timeout tick — re-check stop, keep reading
 		} else {
+			obs_log(LOG_WARNING, "Spancam: DIAG read ended n=%d err=%d (got %zu/%zu)", n,
+				spancam_last_error(), got, len);
 			return false; // EOF or hard error
 		}
 	}
@@ -365,38 +409,98 @@ static void spancam_send_bitrate(struct spancam_source *ctx, int bps)
 // Rate-limited to ~1 Hz so the phone's encoder isn't reconfigured constantly, and
 // re-anchored after every change so the next measurement reflects the new rate
 // rather than the backlog left over from the old one.
+// Closed-loop ABR — the SAME AIMD the Mac receiver runs (mac/Spancam/Core/
+// BitrateController.swift), not an approximation of it.
+//
+// The previous loop was a 30-line stand-in that got four of the algorithm's invariants
+// wrong, and bounding the phone's SO_SNDBUF (so its backpressure valve can finally
+// engage) made the consequence impossible to miss on real hardware: the phone logged
+// `BACKPRESSURE latch exit: dropping 260ms` bursts every two seconds while this end
+// walked the target 5287 -> 5816 -> 6220 kbps straight back to the ceiling, re-saturating
+// the link and triggering another drop burst plus an IDR storm. A ~0.5 Hz sawtooth that
+// never converges, where the Mac settles on the same link.
+//
+// The four corrections:
+//   1. ADDITIVE increase (+300 kbps), not multiplicative (+10%). Near a 6.2 Mbps ceiling
+//      +10% is ~620 kbps per step, which overshoots capacity in one move.
+//   2. A post-cut COOLDOWN (3 s) plus two consecutive HEALTHY ticks before any increase.
+//      Previously a cut at t could be followed by a raise at t+1s.
+//   3. The delay baseline is a WINDOWED MINIMUM, never re-anchored. Re-anchoring to the
+//      current (already-delayed) arrival and zeroing the EWMA after every send made a
+//      STANDING queue structurally unobservable, and a DRAINING queue read as healthy
+//      because arrivals run ahead of the pts grid and the negative delay was clamped to
+//      zero — so the loop always concluded "clear" one second after cutting.
+//   4. A send DEADBAND of max(50 kbps, 5%), so tiny corrections don't thrash
+//      MediaCodec.setParameters.
+//
+// The skew here is (arrival - pts) on this end's monotonic clock. Its ABSOLUTE value is
+// meaningless (the two clocks are unrelated) but its GROWTH is exactly the queuing delay,
+// which is why the minimum over the window is the right zero point.
 static void spancam_abr_observe(struct spancam_source *ctx, int64_t pts_us)
 {
-	int64_t now = (int64_t)os_gettime_ns();
-	if (!ctx->abr_base_set) {
+	const int64_t now = (int64_t)os_gettime_ns();
+	const int64_t skew = now - pts_us * 1000;
+
+	// Rolling baseline: the smallest skew seen in the last SPANCAM_ABR_BASELINE_NS. Kept
+	// as two buckets so the window slides without storing every sample.
+	if (!ctx->abr_base_set || now - ctx->abr_bucket_start_ns > SPANCAM_ABR_BASELINE_NS / 2) {
+		ctx->abr_min_prev = ctx->abr_base_set ? ctx->abr_min_cur : skew;
+		ctx->abr_min_cur = skew;
+		ctx->abr_bucket_start_ns = now;
 		ctx->abr_base_set = true;
-		ctx->abr_base_arrival_ns = now;
-		ctx->abr_base_pts_us = pts_us;
-		ctx->abr_delay_ewma_ns = 0;
 	}
-	int64_t expected = ctx->abr_base_arrival_ns + (pts_us - ctx->abr_base_pts_us) * 1000;
-	int64_t delay = now - expected; // how far behind the grid we've fallen
-	if (delay < 0)
-		delay = 0;
-	ctx->abr_delay_ewma_ns = (ctx->abr_delay_ewma_ns * 7 + delay) / 8;
+	if (skew < ctx->abr_min_cur)
+		ctx->abr_min_cur = skew;
+	const int64_t baseline = ctx->abr_min_prev < ctx->abr_min_cur ? ctx->abr_min_prev : ctx->abr_min_cur;
+	int64_t queue_ns = skew - baseline;
+	if (queue_ns < 0)
+		queue_ns = 0;
+	ctx->abr_delay_ewma_ns = (ctx->abr_delay_ewma_ns * 7 + queue_ns) / 8;
+
 	if (ctx->ctrl_fd == SPANCAM_BAD_SOCKET || ctx->abr_ceiling <= 0)
 		return;
-	if (now - ctx->abr_last_send_ns < 1000000000LL) // ~1 Hz
+	if (now - ctx->abr_last_tick_ns < 1000000000LL) // evaluate at ~1 Hz
 		return;
-	if (ctx->abr_delay_ewma_ns > 250000000LL) { // >250 ms of queue — congested
-		ctx->abr_target = ctx->abr_target * 85 / 100;
-		if (ctx->abr_target < 800000)
-			ctx->abr_target = 800000;
-	} else if (ctx->abr_delay_ewma_ns < 60000000LL && ctx->abr_target < ctx->abr_ceiling) {
-		ctx->abr_target += ctx->abr_target / 10; // +10%
-		if (ctx->abr_target > ctx->abr_ceiling)
-			ctx->abr_target = ctx->abr_ceiling;
+	ctx->abr_last_tick_ns = now;
+
+	const int floor_bps = ctx->abr_ceiling * 45 / 100 > 800000 ? ctx->abr_ceiling * 45 / 100 : 800000;
+	int target = ctx->abr_target;
+
+	if (ctx->abr_delay_ewma_ns > SPANCAM_ABR_QUEUE_HIGH_NS) {
+		// Congested: multiplicative decrease, and arm the cooldown so the climb cannot
+		// start again until the queue has had time to actually drain.
+		target = target * 85 / 100;
+		if (target < floor_bps)
+			target = floor_bps;
+		ctx->abr_cooldown_until_ns = now + SPANCAM_ABR_COOLDOWN_NS;
+		ctx->abr_healthy_ticks = 0;
+	} else if (ctx->abr_delay_ewma_ns < SPANCAM_ABR_QUEUE_LOW_NS) {
+		// Clear. Require the cooldown to have expired AND two consecutive healthy ticks.
+		ctx->abr_healthy_ticks++;
+		if (now < ctx->abr_cooldown_until_ns || ctx->abr_healthy_ticks < 2)
+			return;
+		if (target >= ctx->abr_ceiling)
+			return;
+		target += SPANCAM_ABR_INCREASE_BPS;
+		if (target > ctx->abr_ceiling)
+			target = ctx->abr_ceiling;
 	} else {
-		return; // in between — hold, keep measuring
+		// In between: hold, and do NOT accrue healthy ticks.
+		ctx->abr_healthy_ticks = 0;
+		return;
 	}
+
+	// Deadband — max(50 kbps, 5%) — so setParameters is not called for noise.
+	const int delta = target > ctx->abr_target ? target - ctx->abr_target : ctx->abr_target - target;
+	const int need = ctx->abr_target / 20 > 50000 ? ctx->abr_target / 20 : 50000;
+	if (delta < need)
+		return;
+
+	ctx->abr_target = target;
 	ctx->abr_last_send_ns = now;
 	spancam_send_bitrate(ctx, ctx->abr_target);
-	ctx->abr_base_set = false; // re-anchor so the next reading reflects the new rate
+	obs_log(LOG_DEBUG, "Spancam: abr target=%d kbps qDelay=%d ms", ctx->abr_target / 1000,
+		(int)(ctx->abr_delay_ewma_ns / 1000000));
 }
 
 // --------------------------------------------------------------------------
@@ -491,7 +595,8 @@ static void spancam_run(const char *cmd)
 // A cable serial is a plain device id; a wireless one is either an mDNS instance
 // ("adb-<serial>-xxxxx._adb-tls-connect._tcp") or "<ip>:<port>". Both contain a
 // character a cable serial never does, so the test is exact rather than a guess.
-static bool spancam_adb_usb_device(char *serial_out, size_t serialsz)
+// Cable devices only, with a COUNT so a pinned source can refuse an ambiguous USB path.
+static bool spancam_adb_usb_device_count(char *serial_out, size_t serialsz, int *count_out)
 {
 	const char *adb = spancam_adb_path();
 	if (!adb)
@@ -503,6 +608,7 @@ static bool spancam_adb_usb_device(char *serial_out, size_t serialsz)
 		return false;
 	char line[256];
 	bool found = false, saw_wireless = false;
+	int cables = 0;
 	while (fgets(line, sizeof(line), f)) {
 		char *tab = strstr(line, "\tdevice"); // "<serial>\tdevice"; skips the header
 		if (!tab)
@@ -512,16 +618,25 @@ static bool spancam_adb_usb_device(char *serial_out, size_t serialsz)
 			saw_wireless = true; // adb over Wi-Fi — not a cable
 			continue;
 		}
+		cables++;
 		if (!found) {
 			snprintf(serial_out, serialsz, "%.*s", (int)serialsz - 1, line);
 			found = true;
 		}
 	}
 	spancam_pclose(f);
+	if (count_out)
+		*count_out = cables;
 	if (!found && saw_wireless)
 		obs_log(LOG_INFO, "Spancam: adb sees only a WIRELESS device — that is not a cable, "
 				  "so USB is unavailable and Wi-Fi is the honest path");
 	return found;
+}
+
+// Convenience wrapper for callers that only need "is a cable present".
+static bool spancam_adb_usb_device(char *serial_out, size_t serialsz)
+{
+	return spancam_adb_usb_device_count(serial_out, serialsz, NULL);
 }
 
 // Broadcast a probe and parse the first reply.
@@ -529,6 +644,109 @@ static bool spancam_adb_usb_device(char *serial_out, size_t serialsz)
 // address, not anything the phone claims about itself — a phone behind NAT or
 // with several interfaces up doesn't reliably know which of its addresses we can
 // actually reach, but the packet that just arrived proves one of them.
+// --------------------------------------------------------------------------
+// Device enumeration — one row per reachable phone, so a source can be PINNED
+// to a specific handset.
+//
+// Without this the plugin was single-device by construction: the UDP path took
+// "the first reply" and the Bonjour path took the first browse result, so two
+// sources in one scene both raced onto the same phone (and, because each phone
+// accepts exactly one SDSP client and evicts the previous one, they then evicted
+// each other on the 1.5 s redial forever — neither ever got a stable stream).
+// The Mac app has always had a device picker; this is the OBS equivalent.
+//
+// The row's IDENTITY is the phone's NAME, never its address or key, and the dial
+// re-resolves it every attempt. That is deliberate: the SDSP access token is
+// regenerated on every app launch and the phone's DHCP lease can move, so a
+// pinned host+token goes stale the moment the phone's app restarts (measured:
+// "bad or missing stream header" forever until retyped). Re-resolving by name
+// makes both self-healing.
+struct spancam_device {
+	char name[128];
+	char host[128];
+	int port;
+	char token[128];
+	bool via_mdns;
+};
+
+#define SPANCAM_MAX_DEVICES 8
+
+// Collect every phone that answers the UDP broadcast (Android). Unlike
+// spancam_udp_discover this drains the whole reply window instead of stopping at
+// the first datagram, and de-dupes by source address.
+static int spancam_udp_enumerate(struct spancam_source *ctx, struct spancam_device *out, int max)
+{
+	int count = 0;
+	spancam_socket_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd == SPANCAM_BAD_SOCKET)
+		return 0;
+	int yes = 1;
+	setsockopt(fd, SOL_SOCKET, SO_BROADCAST, SPANCAM_SOCKOPT(&yes), sizeof(yes));
+#if defined(_WIN32)
+	DWORD tv = 400;
+#else
+	struct timeval tv = {.tv_sec = 0, .tv_usec = 400000};
+#endif
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, SPANCAM_SOCKOPT(&tv), sizeof(tv));
+
+	struct sockaddr_in to = {0};
+	to.sin_family = AF_INET;
+	to.sin_port = htons(SPANCAM_DISCOVERY_PORT);
+	to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+	sendto(fd, SPANCAM_PROBE, (int)sizeof(SPANCAM_PROBE) - 1, 0, (struct sockaddr *)&to, sizeof(to));
+
+	// Several probes: one datagram can be lost, and a phone that just woke its
+	// Wi-Fi may miss the first.
+	for (int round = 0; round < 6 && count < max && os_event_try(ctx->stop_signal) == EAGAIN; round++) {
+		char buf[256];
+		struct sockaddr_in from = {0};
+		spancam_socklen_t flen = sizeof(from);
+		int n = recvfrom(fd, buf, (int)sizeof(buf) - 1, 0, (struct sockaddr *)&from, &flen);
+		if (n <= 0) {
+			sendto(fd, SPANCAM_PROBE, (int)sizeof(SPANCAM_PROBE) - 1, 0, (struct sockaddr *)&to,
+			       sizeof(to));
+			continue;
+		}
+		buf[n] = 0;
+		if (strncmp(buf, "SPANCAM-OBS|", 12) != 0)
+			continue;
+		char ip[INET_ADDRSTRLEN] = {0};
+		inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+		bool dup = false;
+		for (int i = 0; i < count; i++)
+			if (strcmp(out[i].host, ip) == 0)
+				dup = true;
+		if (dup)
+			continue;
+		// SPANCAM-OBS|name|port|token|codec|w|h — the NAME may legitimately contain
+		// spaces, so split on '|' by hand rather than with strtok (which also
+		// collapses empty fields and would shift every later column).
+		char *f[8] = {0};
+		int nf = 0;
+		char *cur = buf;
+		while (nf < 8) {
+			f[nf++] = cur;
+			char *bar = strchr(cur, '|');
+			if (!bar)
+				break;
+			*bar = 0;
+			cur = bar + 1;
+		}
+		if (nf < 4)
+			continue;
+		struct spancam_device *d = &out[count++];
+		snprintf(d->name, sizeof(d->name), "%s", f[1]);
+		snprintf(d->host, sizeof(d->host), "%s", ip);
+		d->port = atoi(f[2]);
+		if (d->port <= 0)
+			d->port = SPANCAM_DEFAULT_PORT;
+		snprintf(d->token, sizeof(d->token), "%s", f[3]);
+		d->via_mdns = false;
+	}
+	spancam_closesocket(fd);
+	return count;
+}
+
 static bool spancam_udp_discover(struct spancam_source *ctx, char *host, size_t hostsz, int *port, char *token,
 				 size_t toksz)
 {
@@ -675,7 +893,98 @@ static bool spancam_mdns_discover(struct spancam_source *ctx, char *host, size_t
 	snprintf(token, toksz, "%s", st.token);
 	return true;
 }
+
+// Enumerate EVERY advertised `_spancam-sdsp._tcp` instance (this is how iPhones are
+// found — they cannot answer the UDP broadcast without the multicast entitlement).
+// spancam_mdns_discover above deliberately stops at the first service because it only
+// needs *a* phone; the picker needs them all.
+struct spancam_mdns_names {
+	char names[SPANCAM_MAX_DEVICES][128];
+	uint32_t ifIndex[SPANCAM_MAX_DEVICES];
+	char regtype[64], domain[128];
+	int count;
+};
+
+static void DNSSD_API spancam_browse_all_cb(DNSServiceRef ref, DNSServiceFlags flags, uint32_t ifIndex,
+					    DNSServiceErrorType err, const char *name, const char *regtype,
+					    const char *domain, void *ctxv)
+{
+	UNUSED_PARAMETER(ref);
+	struct spancam_mdns_names *st = ctxv;
+	if (err != kDNSServiceErr_NoError || !(flags & kDNSServiceFlagsAdd))
+		return;
+	for (int i = 0; i < st->count; i++)
+		if (strcmp(st->names[i], name) == 0)
+			return; // same instance on another interface
+	if (st->count >= SPANCAM_MAX_DEVICES)
+		return;
+	snprintf(st->names[st->count], sizeof(st->names[0]), "%s", name);
+	st->ifIndex[st->count] = ifIndex;
+	st->count++;
+	snprintf(st->regtype, sizeof(st->regtype), "%s", regtype);
+	snprintf(st->domain, sizeof(st->domain), "%s", domain);
+}
+
+static int spancam_mdns_enumerate(struct spancam_source *ctx, struct spancam_device *out, int max)
+{
+	struct spancam_mdns_names names = {0};
+	DNSServiceRef browse = NULL;
+	if (DNSServiceBrowse(&browse, 0, kDNSServiceInterfaceIndexAny, "_spancam-sdsp._tcp", NULL,
+			     spancam_browse_all_cb, &names) != kDNSServiceErr_NoError)
+		return 0;
+	// Keep pumping the whole window rather than stopping at the first Add, so a
+	// second phone that answers a little later is still listed.
+	for (int i = 0; i < 10 && os_event_try(ctx->stop_signal) == EAGAIN; i++)
+		spancam_mdns_pump(browse, 100);
+	DNSServiceRefDeallocate(browse);
+
+	int count = 0;
+	for (int i = 0; i < names.count && count < max; i++) {
+		struct spancam_mdns_state st = {0};
+		DNSServiceRef resolve = NULL;
+		if (DNSServiceResolve(&resolve, 0, names.ifIndex[i], names.names[i], names.regtype, names.domain,
+				      spancam_resolve_cb, &st) != kDNSServiceErr_NoError)
+			continue;
+		for (int k = 0; k < 7 && !st.have_resolve && os_event_try(ctx->stop_signal) == EAGAIN; k++)
+			spancam_mdns_pump(resolve, 100);
+		DNSServiceRefDeallocate(resolve);
+		if (!st.have_resolve)
+			continue;
+		struct spancam_device *d = &out[count++];
+		snprintf(d->name, sizeof(d->name), "%s", names.names[i]);
+		snprintf(d->host, sizeof(d->host), "%s", st.hosttarget);
+		d->port = st.port > 0 ? st.port : SPANCAM_DEFAULT_PORT;
+		snprintf(d->token, sizeof(d->token), "%s", st.token);
+		d->via_mdns = true;
+	}
+	return count;
+}
 #endif // __APPLE__
+
+// Every reachable phone, both transports, de-duped by name. Android answers the UDP
+// broadcast; iOS advertises over mDNS. On platforms without a Bonjour client only the
+// UDP half runs, which is exactly the pre-existing iOS limitation — the picker simply
+// shows fewer rows there rather than behaving differently.
+static int spancam_enumerate_devices(struct spancam_source *ctx, struct spancam_device *out, int max)
+{
+	int count = spancam_udp_enumerate(ctx, out, max);
+#if defined(__APPLE__)
+	if (count < max) {
+		struct spancam_device m[SPANCAM_MAX_DEVICES];
+		int mc = spancam_mdns_enumerate(ctx, m, max - count);
+		for (int i = 0; i < mc && count < max; i++) {
+			bool dup = false;
+			for (int k = 0; k < count; k++)
+				if (strcmp(out[k].name, m[i].name) == 0)
+					dup = true;
+			if (!dup)
+				out[count++] = m[i];
+		}
+	}
+#endif
+	return count;
+}
+
 
 // --------------------------------------------------------------------------
 // FFmpeg decode -> OBS.
@@ -696,27 +1005,53 @@ static bool spancam_mdns_discover(struct spancam_source *ctx, char *host, size_t
 // a horizontal mirror is just R180 composed with it, so every combination the wire
 // can ask for maps onto that pair:
 //
+// DIRECTION: the wire angle is CLOCKWISE — shared/PROTOCOL.md §3 (0x21) says "the
+// rotation (clockwise, 0/90/180/270) the receiver must apply". libobs rotates the
+// OTHER way: rotate_async_video (obs-source.c) ends with
+//     gs_matrix_rotaa4f(0.0f, 0.0f, -1.0f, RAD(rotation));
+// i.e. about NEGATIVE Z, which in OBS's Y-down space is counter-clockwise. Tracking
+// the corners of a 1920x1080 frame through the rotation=90 case (translate(0,w) then
+// rotate) puts the source's TOP edge on the LEFT edge of the output, confirming CCW.
+//
+// So a clockwise wire angle must be negated before it is handed to OBS. This was the
+// "OBS output is upside down" bug: 0 and 180 are unaffected (180 is its own inverse),
+// so only the two PORTRAIT angles were wrong — and they were wrong by exactly 180
+// degrees, which reads as an inverted image rather than a sideways one. Measured on
+// device: an S24 Ultra held portrait sends rot=270 (OrientationTracker.effective() =
+// sensorOrientation 90 - display 0, i.e. 90 for the front lens path / 270 here), the
+// Mac receiver renders it upright via EXIF 8 (OrientationStage.swift:133), and OBS
+// rendered it inverted from the identical wire value.
+//
+// frame.flip is a VERTICAL flip (GS_FLIP_V), and a horizontal mirror is R180 composed
+// with it. Writing Rccw/Rcw for the two directions, Hm for the wire's horizontal
+// mirror and Vf for OBS's vertical flip, the wire asks for Hm . Rcw(rot) while OBS
+// produces Rccw(obs_rotation) . Vf. Using Hm = R180 . Vf and Vf . Rcw(t) = Rccw(t) . Vf:
+//
+//     mirror 0:  Rccw(obs) = Rcw(rot)                  -> obs = (360 - rot) % 360
+//     mirror 1:  Rccw(obs) . Vf = R180 . Vf . Rcw(rot)
+//                              = Rccw(rot + 180) . Vf  -> obs = (rot + 180) % 360
+//
 //     wire rot  mirror  ->  obs_rotation  frame.flip
 //            0       0            0         false
 //            0       1          180          true
-//           90       0           90         false
-//           90       1           90          true
+//           90       0          270         false
+//           90       1          270          true
 //          180       0          180         false
 //          180       1            0          true
-//          270       0          270         false
-//          270       1          270          true
+//          270       0           90         false
+//          270       1           90          true
 //
-//   i.e. flip = mirror, and obs_rotation = mirror ? (180 - rot) mod 360 : rot.
+// (The previous table was verified against the old CPU kernel rather than against an
+// upright image, so both implementations shared the same inverted convention and the
+// comparison could not catch it. Verify this one against a real portrait capture.)
 //
-// Verified exhaustively against the old CPU kernel: for all 8 combinations, on a
-// non-square odd-sized plane, the two produce an identical pixel mapping and
-// identical output geometry. The frame now goes to OBS straight from the AVFrame
-// planes, so the per-frame copy is gone too — and I444, which the CPU path silently
-// refused to rotate, now works like everything else.
+// NOTE for users who had set the Rotation dropdown to compensate: it composes on top
+// of the wire angle, so a previously-compensating value must go back to 0.
 static void spancam_wire_to_obs_transform(int rot, int mir, long *obs_rotation, bool *flip)
 {
 	*flip = mir != 0;
-	*obs_rotation = mir ? ((180 - rot) + 360) % 360 : rot;
+	rot = ((rot % 360) + 360) % 360;
+	*obs_rotation = mir ? (rot + 180) % 360 : (360 - rot) % 360;
 }
 
 // One frame out to OBS. Both decode backends land here, so the geometry, colour
@@ -1204,6 +1539,7 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 	char *mhost = bstrdup(ctx->host ? ctx->host : "");
 	int mport = ctx->port > 0 ? ctx->port : SPANCAM_DEFAULT_PORT;
 	char *mtoken = bstrdup(ctx->token ? ctx->token : "");
+	char *mdevice = bstrdup(ctx->device ? ctx->device : "");
 	pthread_mutex_unlock(&ctx->cfg_lock);
 
 	spancam_socket_t fd = SPANCAM_BAD_SOCKET;
@@ -1214,9 +1550,26 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 	bool usb_cooling = (mode == SPANCAM_CONN_AUTO) && (ctx->usb_cooldown_until_ns > (int64_t)os_gettime_ns());
 
 	// ---- USB, if a phone is on the end of a CABLE ----
+	//
+	// A source PINNED to a phone may only take the USB path when exactly one cable is
+	// attached. `adb forward` is keyed on an adb serial, and an adb serial cannot be matched
+	// to the SDSP device name the user picked — so with two cabled phones the USB branch
+	// would tunnel to whichever one adb happened to list first and quietly serve the WRONG
+	// camera, which is precisely the guarantee the Phone dropdown exists to make. Wi-Fi can
+	// target a phone by name, so that is the honest fallback; the only thing lost is some
+	// latency, and only in the two-cables case.
 	char adb_serial[128] = {0};
-	if ((mode == SPANCAM_CONN_USB || (mode == SPANCAM_CONN_AUTO && !usb_cooling)) &&
-	    spancam_adb_usb_device(adb_serial, sizeof(adb_serial))) {
+	int cable_count = 0;
+	bool usb_ok = (mode == SPANCAM_CONN_USB || (mode == SPANCAM_CONN_AUTO && !usb_cooling)) &&
+		      spancam_adb_usb_device_count(adb_serial, sizeof(adb_serial), &cable_count);
+	if (usb_ok && *mdevice && cable_count > 1) {
+		obs_log(LOG_WARNING,
+			"Spancam[%s]: %d cabled phones but this source is pinned to \"%s\" — adb cannot "
+			"tell them apart, so staying on Wi-Fi to guarantee the right phone",
+			obs_source_get_name(ctx->source), cable_count, mdevice);
+		usb_ok = false;
+	}
+	if (usb_ok) {
 		char cmd[1160];
 		// -s scopes the forward: with two devices attached an unscoped `adb forward`
 		// errors out or silently tunnels to the wrong phone.
@@ -1255,6 +1608,29 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 			snprintf(host, sizeof(host), "%s", mhost);
 			snprintf(token, sizeof(token), "%s", mtoken);
 			resolved = true;
+		} else if (*mdevice) {
+			// PINNED to one phone: re-resolve it by name on every dial, so two sources
+			// in one scene stay on their own handsets and a relaunched phone app (new
+			// access token) or a fresh DHCP lease is picked up automatically.
+			struct spancam_device devs[SPANCAM_MAX_DEVICES];
+			int n = spancam_enumerate_devices(ctx, devs, SPANCAM_MAX_DEVICES);
+			for (int i = 0; i < n; i++) {
+				if (strcmp(devs[i].name, mdevice) != 0)
+					continue;
+				snprintf(host, sizeof(host), "%s", devs[i].host);
+				snprintf(token, sizeof(token), "%s", devs[i].token);
+				port = devs[i].port;
+				resolved = true;
+				break;
+			}
+			if (resolved)
+				obs_log(LOG_INFO, "Spancam[%s]: pinned to \"%s\" -> %s:%d",
+					obs_source_get_name(ctx->source), mdevice, host, port);
+			else
+				obs_log(LOG_WARNING,
+					"Spancam[%s]: pinned phone \"%s\" is NOT on the network — this source "
+					"stays black rather than grabbing a different phone",
+					obs_source_get_name(ctx->source), mdevice);
 		} else if (spancam_udp_discover(ctx, host, sizeof(host), &port, token, sizeof(token))) {
 			resolved = true; // Android answers the UDP broadcast
 #if defined(__APPLE__)
@@ -1274,6 +1650,7 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 done:
 	bfree(mhost);
 	bfree(mtoken);
+	bfree(mdevice);
 	return fd;
 }
 
@@ -1282,11 +1659,17 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	char token[128] = {0};
 	char label[160] = {0};
 	bool used_usb = false;
+	// Declared before any `goto done` so the teardown can read it. Auto is sampled once so
+	// the promotion check never forks adb on a source the user pinned to Wi-Fi or USB.
+	bool promoted = false;
+	pthread_mutex_lock(&ctx->cfg_lock);
+	const bool mode_is_auto = ctx->connection == SPANCAM_CONN_AUTO;
+	pthread_mutex_unlock(&ctx->cfg_lock);
 	bool got_stream = false; // a valid StreamHeader arrived => this path actually works
 	spancam_socket_t fd = spancam_dial(ctx, token, sizeof(token), label, sizeof(label), &used_usb);
 	if (fd == SPANCAM_BAD_SOCKET)
 		return;
-	obs_log(LOG_INFO, "Spancam: connected (%s)", label);
+	obs_log(LOG_INFO, "Spancam[%s]: connected (%s)", obs_source_get_name(ctx->source), label);
 
 	// Handshake: "SPANCAM/1 k=<token> app=OBS os=<os> link=<usb|wifi>\n". The token
 	// gates Wi-Fi access; app/os only let the phone show who connected.
@@ -1370,6 +1753,38 @@ static void spancam_stream_once(struct spancam_source *ctx)
 					ctx->wd_dead_secs);
 				break;
 			}
+
+			// USB PROMOTION, the Mac path's Wi-Fi->USB hot swap.
+			//
+			// Transport used to be decided once, inside spancam_dial, so a cable plugged
+			// in DURING a Wi-Fi session was invisible until that session happened to drop
+			// — the switch eventually arrived but on no predictable schedule, and the
+			// latency win with it. The Mac receiver does not wait: the phone orchestrates
+			// the promotion the moment the accessory opens. Here the plugin is the dialer,
+			// so the plugin has to watch.
+			//
+			// Only while streaming over Wi-Fi in Auto, only every few seconds (each check
+			// forks adb), and only when a CABLE device is present — a wireless-adb device
+			// is not a cable and promoting to it would push the USB rung over Wi-Fi.
+			if (!used_usb && !promoted && mode_is_auto &&
+			    wnow >= ctx->usb_probe_next_ns) {
+				ctx->usb_probe_next_ns = wnow + SPANCAM_USB_PROBE_NS;
+				char cable[128] = {0};
+				if (spancam_adb_usb_device(cable, sizeof(cable))) {
+					obs_log(LOG_INFO,
+						"Spancam[%s]: USB cable attached — promoting from Wi-Fi to USB",
+						obs_source_get_name(ctx->source));
+					promoted = true;
+					break;
+				}
+				// Back off the PROBE itself once promotions keep failing. Without this a
+				// USB path that connects but never streams is retried the instant the 8 s
+				// bench expires, forever: promote, fail, bench, fall back, promote… which
+				// on a phone that rebuilds its camera per rung is a permanent reconnect
+				// storm rather than a graceful "USB is not working, stay on Wi-Fi".
+				if (ctx->promote_fails >= 2)
+					ctx->usb_probe_next_ns = wnow + 60000000000LL; // 60 s
+			}
 		}
 
 		uint8_t ph[16];
@@ -1428,6 +1843,20 @@ done:
 		ctx->redials++;
 	if (used_usb && !got_stream)
 		ctx->usb_cooldown_until_ns = (int64_t)os_gettime_ns() + 8000000000LL; // 8 s
+	// A deliberate promotion is not a failure: reset the redial ladder so the USB dial
+	// happens on the next tick instead of waiting out a backoff earned by real errors.
+	if (promoted) {
+		ctx->redials = 0;
+		ctx->promote_now = true;
+	}
+	// A promotion that connected over USB but produced no stream is a FAILED promotion.
+	// Count them so the probe above can stop hammering a USB path that does not work.
+	if (used_usb) {
+		if (got_stream)
+			ctx->promote_fails = 0;
+		else if (ctx->promote_fails < 100)
+			ctx->promote_fails++;
+	}
 	ctx->ctrl_fd = SPANCAM_BAD_SOCKET; // the control channel goes with the connection
 	spancam_close_decoder(ctx);
 	spancam_closesocket(fd);
@@ -1459,6 +1888,10 @@ static void *spancam_receive_loop(void *data)
 	while (os_event_try(ctx->stop_signal) == EAGAIN) {
 		spancam_stream_once(ctx);
 		int wait = spancam_redial_ms(ctx->redials);
+		if (ctx->promote_now) {
+			ctx->promote_now = false;
+			wait = 100; // promoting to a cable — reconnect immediately
+		}
 		if (ctx->redials == SPANCAM_MAX_REDIALS)
 			obs_log(LOG_INFO,
 				"Spancam: %d redials with no video — backing off to %d s; "
@@ -1485,10 +1918,113 @@ static void spancam_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "rotation", 0);
 }
 
+// Keep the "Name" field and the real source name in agreement.
+//
+// Two directions, and BOTH are needed. Writing the live name into the setting means the
+// field shows the current name instead of being blank. Listening for OBS's own "rename"
+// signal means a right-click rename updates the setting too — without that, the stored
+// label would still hold the OLD name and the next properties-OK would silently rename the
+// source back, which is worse than not having the field at all.
+static void spancam_sync_label(struct spancam_source *ctx)
+{
+	const char *name = obs_source_get_name(ctx->source);
+	if (!name)
+		return;
+	obs_data_t *settings = obs_source_get_settings(ctx->source);
+	if (!settings)
+		return;
+	const char *cur = obs_data_get_string(settings, "label");
+	if (!cur || strcmp(cur, name) != 0)
+		obs_data_set_string(settings, "label", name);
+	obs_data_release(settings);
+}
+
+static void spancam_renamed(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	spancam_sync_label((struct spancam_source *)data);
+}
+
+// Fill the device dropdown from a live scan. "Any" stays first so the default is the
+// old auto-pick behaviour; every phone found is then listed by name.
+static void spancam_fill_devices(struct spancam_source *ctx, obs_property_t *list)
+{
+	obs_property_list_clear(list);
+	obs_property_list_add_string(list, obs_module_text("Spancam.Device.Any"), "");
+	if (!ctx)
+		return;
+	struct spancam_device devs[SPANCAM_MAX_DEVICES];
+	int n = spancam_enumerate_devices(ctx, devs, SPANCAM_MAX_DEVICES);
+
+	pthread_mutex_lock(&ctx->cfg_lock);
+	char *pinned = bstrdup(ctx->device ? ctx->device : "");
+	pthread_mutex_unlock(&ctx->cfg_lock);
+	bool pinned_listed = false;
+
+	for (int i = 0; i < n; i++) {
+		struct dstr label;
+		dstr_init(&label);
+		dstr_printf(&label, "%s (%s)", devs[i].name, devs[i].host);
+		obs_property_list_add_string(list, label.array, devs[i].name);
+		dstr_free(&label);
+		if (*pinned && strcmp(devs[i].name, pinned) == 0)
+			pinned_listed = true;
+	}
+
+	// A LIST-type combo snaps to item 0 whenever the stored value is missing, and OBS
+	// writes that back — so a single scan that did not see the phone (asleep, Discoverable
+	// just toggled, a lost mDNS packet) silently reset the source to "Any", which then
+	// auto-picked whichever phone answered first. That is exactly the "I selected iPhone
+	// but Android was streaming" failure. Re-adding the pinned name keeps the selection
+	// intact across a miss, and says plainly that it is not currently reachable.
+	if (*pinned && !pinned_listed) {
+		struct dstr label;
+		dstr_init(&label);
+		dstr_printf(&label, "%s %s", pinned, obs_module_text("Spancam.Device.Offline"));
+		obs_property_list_add_string(list, label.array, pinned);
+		dstr_free(&label);
+	}
+	obs_log(LOG_INFO, "Spancam[%s]: device scan found %d phone(s), pinned=\"%s\"%s",
+		obs_source_get_name(ctx->source), n, pinned,
+		(*pinned && !pinned_listed) ? " (not reachable)" : "");
+	bfree(pinned);
+}
+
+// "Refresh" re-scans. A scan takes about a second (UDP window + Bonjour resolve), so it
+// is deliberately a button rather than something that runs on every dialog repaint.
+static bool spancam_refresh_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(p);
+	obs_property_t *list = obs_properties_get(props, "device");
+	if (list)
+		spancam_fill_devices((struct spancam_source *)data, list);
+	return true;
+}
+
 static obs_properties_t *spancam_source_get_properties(void *data)
 {
-	UNUSED_PARAMETER(data);
+	struct spancam_source *sctx = data;
 	obs_properties_t *props = obs_properties_create();
+
+	// THIS SOURCE's name, editable right here. With several phones a scene otherwise reads
+	// "Spancam Camera", "Spancam Camera 2"… and nothing says which handset each one holds.
+	// OBS's own right-click Rename works but is easy to miss, so the name sits directly above
+	// the phone it is bound to. Seeded with the live source name (see spancam_sync_label) so
+	// the field always shows the current name rather than being confusingly blank.
+	obs_properties_add_text(props, "label", obs_module_text("Spancam.Prop.Label"), OBS_TEXT_DEFAULT);
+	if (sctx)
+		spancam_sync_label(sctx);
+
+	// WHICH PHONE this source uses. Populated by a live scan on dialog open, so two
+	// sources in one scene can be pinned to two different handsets — previously both
+	// raced onto whichever phone answered first and then evicted each other forever,
+	// because each phone serves exactly one SDSP client.
+	obs_property_t *dev = obs_properties_add_list(props, "device", obs_module_text("Spancam.Prop.Device"),
+						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	spancam_fill_devices((struct spancam_source *)data, dev);
+	obs_properties_add_button2(props, "refresh", obs_module_text("Spancam.Prop.Refresh"),
+				   spancam_refresh_clicked, data);
+
 	obs_property_t *conn = obs_properties_add_list(props, "connection", obs_module_text("Spancam.Prop.Connection"),
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(conn, obs_module_text("Spancam.Conn.Auto"), SPANCAM_CONN_AUTO);
@@ -1511,8 +2047,18 @@ static void spancam_source_update(void *data, obs_data_t *settings)
 	pthread_mutex_lock(&ctx->cfg_lock);
 	bfree(ctx->host);
 	bfree(ctx->token);
+	bfree(ctx->device);
 	ctx->host = NULL;
 	ctx->token = NULL;
+	// WHICH PHONE this source is bound to. Reading this is what makes the "Phone"
+	// dropdown authoritative; while it was missing here `ctx->device` stayed NULL no
+	// matter what the dialog showed, so every source silently fell through to
+	// auto-discovery and grabbed whichever phone answered first. With two sources that
+	// meant both landed on the SAME phone and — since a phone serves one SDSP client and
+	// evicts the previous one — they evicted each other about twice a second. That is
+	// exactly the "I selected iPhone but Android was streaming" report and the ~2 Hz
+	// flicker in both the OBS preview and the phone's own UI.
+	ctx->device = bstrdup(obs_data_get_string(settings, "device"));
 	ctx->connection = (int)obs_data_get_int(settings, "connection");
 	// One address field, not two. The port is 8892 on every phone unless Android's
 	// bind fell back to an ephemeral one, which is rare enough that a whole spin box
@@ -1548,6 +2094,16 @@ static void spancam_source_update(void *data, obs_data_t *settings)
 	// the newest frame each tick, which is what a camera wants. Every capture plugin in
 	// obs-studio does this, including plugins/win-dshow, which this file follows.
 	obs_source_set_async_unbuffered(ctx->source, true);
+
+	// Rename the source to the typed label. Done AFTER the lock is released because
+	// obs_source_set_name emits a signal that handlers may act on. Only on a real change,
+	// and never to a blank, so leaving the field empty simply keeps the current name.
+	const char *label = obs_data_get_string(settings, "label");
+	if (label && *label) {
+		const char *cur = obs_source_get_name(ctx->source);
+		if (!cur || strcmp(cur, label) != 0)
+			obs_source_set_name(ctx->source, label);
+	}
 }
 
 static void *spancam_source_create(obs_data_t *settings, obs_source_t *source)
@@ -1558,6 +2114,9 @@ static void *spancam_source_create(obs_data_t *settings, obs_source_t *source)
 	pthread_mutex_init(&ctx->cfg_lock, NULL);
 	os_event_init(&ctx->stop_signal, OS_EVENT_TYPE_MANUAL);
 	spancam_source_update(ctx, settings);
+	// Track renames so the "Name" field never holds a stale value (see spancam_sync_label).
+	signal_handler_connect(obs_source_get_signal_handler(source), "rename", spancam_renamed, ctx);
+	spancam_sync_label(ctx);
 	ctx->thread_running = (pthread_create(&ctx->thread, NULL, spancam_receive_loop, ctx) == 0);
 	return ctx;
 }
@@ -1565,6 +2124,7 @@ static void *spancam_source_create(obs_data_t *settings, obs_source_t *source)
 static void spancam_source_destroy(void *data)
 {
 	struct spancam_source *ctx = data;
+	signal_handler_disconnect(obs_source_get_signal_handler(ctx->source), "rename", spancam_renamed, ctx);
 	if (ctx->thread_running) {
 		os_event_signal(ctx->stop_signal);
 		pthread_join(ctx->thread, NULL);
