@@ -56,6 +56,13 @@ function(set_target_properties_plugin target)
 
   configure_file(cmake/windows/resources/resource.rc.in "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_PROJECT_NAME}.rc")
   target_sources(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_PROJECT_NAME}.rc")
+
+  # Inno Setup script for the .exe installer, compiled by Package-Windows.ps1 -BuildInstaller
+  configure_file(
+    cmake/windows/resources/installer-Windows.iss.in
+    "${CMAKE_CURRENT_BINARY_DIR}/installer-Windows.generated.iss"
+    @ONLY
+  )
 endfunction()
 
 # Helper function to add resources into bundle

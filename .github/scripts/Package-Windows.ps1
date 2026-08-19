@@ -3,7 +3,8 @@ param(
     [ValidateSet('x64')]
     [string] $Target = 'x64',
     [ValidateSet('Debug', 'RelWithDebInfo', 'Release', 'MinSizeRel')]
-    [string] $Configuration = 'RelWithDebInfo'
+    [string] $Configuration = 'RelWithDebInfo',
+    [switch] $BuildInstaller
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +54,7 @@ function Package {
         ErrorAction = 'SilentlyContinue'
         Path = @(
             "${ProjectRoot}/release/${ProductName}-*-windows-*.zip"
+            "${ProjectRoot}/release/${ProductName}-*-windows-*.exe"
         )
     }
 
@@ -67,6 +69,42 @@ function Package {
     }
     Compress-Archive -Force @CompressArgs
     Log-Group
+
+    if ( $BuildInstaller ) {
+        # CMake generates the Inno Setup script from cmake/windows/resources/installer-Windows.iss.in
+        $IsccFile = "${ProjectRoot}/build_${Target}/installer-Windows.generated.iss"
+
+        if ( ! ( Test-Path -Path $IsccFile ) ) {
+            throw 'Inno Setup install script not found. Run the build script or the CMake build and install procedures first.'
+        }
+
+        $Iscc = Get-Command iscc -ErrorAction SilentlyContinue
+        if ( $Iscc ) {
+            $IsccPath = $Iscc.Source
+        } elseif ( Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" ) {
+            $IsccPath = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+        } else {
+            throw 'Inno Setup 6 (iscc) not found. Install it or use a runner image that ships it.'
+        }
+
+        Log-Group "Creating installer ${ProductName}..."
+
+        Push-Location -Stack BuildTemp
+        try {
+            Ensure-Location -Path "${ProjectRoot}/release"
+
+            # The .iss expects the installed plugin tree at "Package" relative to
+            # the release directory (see installer-Windows.iss.in).
+            Copy-Item -Path ${Configuration} -Destination Package -Recurse
+
+            Invoke-External $IsccPath ${IsccFile} /O"${ProjectRoot}/release" /F"${OutputName}-Installer"
+        } finally {
+            Remove-Item -Path Package -Recurse -ErrorAction SilentlyContinue
+            Pop-Location -Stack BuildTemp
+        }
+
+        Log-Group
+    }
 }
 
 Package

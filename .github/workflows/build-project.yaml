@@ -65,6 +65,19 @@ jobs:
           plugin_name="$(grep 'name' buildspec.json | sed -E -e 's/^.+"name":[^"]+"(.+)",?$/\1/g')"
           plugin_display_name="$(grep 'displayName' buildspec.json | sed -E -e 's/^.+"displayName":[^"]+"(.+)",?$/\1/g' || echo "")"
 
+          # A release tag must match the version in buildspec.json, otherwise the
+          # release would ship installer files named after a different version.
+          if [[ "${GITHUB_EVENT_NAME}" == 'push' && "${GITHUB_REF_TYPE}" == 'tag' ]]; then
+            spec_version="$(jq -r '.version' buildspec.json)"
+            case "${GITHUB_REF_NAME}" in
+              "${spec_version}"|"${spec_version}"-beta*|"${spec_version}"-rc*) ;;
+              *)
+                echo "::error::Tag '${GITHUB_REF_NAME}' does not match version '${spec_version}' in buildspec.json. Bump \"version\" in buildspec.json, commit, and re-tag."
+                exit 1
+                ;;
+            esac
+          fi
+
           if [[ "${plugin_display_name}" ]]; then
             echo "pluginName=${plugin_display_name}" >> $GITHUB_OUTPUT
           else

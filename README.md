@@ -57,12 +57,15 @@ notarized universal binary (Apple Silicon + Intel); OBS on Apple Silicon will no
 load unsigned plugins, so use the release `.pkg` rather than a self-built bundle
 unless you sign it yourself.
 
-**Windows** — run the installer, or unzip into
-`%ProgramData%\obs-studio\plugins\`. For the USB path you need `adb` on your `PATH`
-(Android Platform Tools).
+**Windows** — run the `-windows-x64-Installer.exe` and follow the prompts (it
+installs into `%ProgramData%\obs-studio\plugins\`; remove it again via *Add or
+remove programs*). Or unzip the `.zip` into that same directory yourself. For the
+USB path you need `adb` on your `PATH` (Android Platform Tools).
 
-**Linux** — unpack the `.tar.xz` into `~/.config/obs-studio/plugins/`, or install
-the `.deb`. `adb` on `PATH` for USB.
+**Linux** — install the `.deb` (`sudo apt install ./spancam-for-obs-*.deb`), or
+unpack the `.tar.xz` and run `./install.sh` — it puts the plugin into
+`~/.config/obs-studio/plugins/` (`./uninstall.sh` removes it). `adb` on `PATH`
+for USB.
 
 Restart OBS, then **Sources → + → Spancam Camera**.
 

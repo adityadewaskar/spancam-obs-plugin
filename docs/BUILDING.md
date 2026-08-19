@@ -52,11 +52,21 @@ uploads the per-platform artifacts to a draft GitHub Release.
 OBS on Apple Silicon will not load an unsigned plugin, and an unsigned `.pkg`
 downloads as "damaged". A real release therefore needs, configured as repository
 secrets (see `.github/workflows` and the template's
-[Codesigning wiki](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS)):
+[Codesigning wiki](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS)).
+The values are the same Apple-account material the Spancam desktop app's CI uses
+(team `539PMW6EW4`) — copy them across:
 
-- a **Developer ID Application** certificate (signs the bundle),
-- a **Developer ID Installer** certificate (signs the `.pkg`),
-- an App Store Connect API key or notarytool credentials (notarization),
+| Secret | Value |
+|---|---|
+| `MACOS_SIGNING_CERT` | base64 of one `.p12` holding **both** "Developer ID Application" **and** "Developer ID Installer" (export both together from Keychain Access) |
+| `MACOS_SIGNING_CERT_PASSWORD` | the `.p12` export password |
+| `MACOS_SIGNING_APPLICATION_IDENTITY` | `Developer ID Application: Aditya Dewaskar (539PMW6EW4)` |
+| `MACOS_SIGNING_INSTALLER_IDENTITY` | `Developer ID Installer: Aditya Dewaskar (539PMW6EW4)` |
+| `MACOS_KEYCHAIN_PASSWORD` | any random string (throwaway CI keychain) |
+| `MACOS_NOTARIZATION_USERNAME` | your Apple ID email — the spancam repo's `APPLE_ID` |
+| `MACOS_NOTARIZATION_PASSWORD` | app-specific password — the spancam repo's `APPLE_APP_SPECIFIC_PASSWORD` |
+
+No provisioning profile is needed (that input is for apps, not plugins).
 
 after which CI signs, `notarytool submit --wait`, and staples. Self-builders who
 don't sign can load their own build after clearing quarantine

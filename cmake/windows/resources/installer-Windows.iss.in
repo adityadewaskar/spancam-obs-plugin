@@ -1,0 +1,38 @@
+; Inno Setup script for the Spancam for OBS installer.
+; Follows the obs-plugintemplate wiki guidance: install into the system-wide
+; third-party plugin directory %ProgramData%\obs-studio\plugins (NOT into the
+; OBS Studio application directory), no license screen (the GPL is not an EULA).
+;
+; Processed by CMake's configure_file into installer-Windows.generated.iss.
+; Package-Windows.ps1 copies release/<Config> to release/Package and runs iscc
+; from the release directory, so the [Files] source below is "Package\*".
+
+#define MyAppName "@CMAKE_PROJECT_NAME@"
+#define MyAppVersion "@CMAKE_PROJECT_VERSION@"
+#define MyAppPublisher "@PLUGIN_AUTHOR@"
+#define MyAppURL "@PLUGIN_WEBSITE@"
+
+[Setup]
+; NOTE: AppId uniquely identifies this plugin for upgrades/uninstall.
+; Do not reuse this value in installers for other applications.
+AppId={{206330B4-714C-42A2-B2AC-A7F35B242AFC}
+AppName=Spancam for OBS
+AppVersion={#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppSupportURL={#MyAppURL}
+AppUpdatesURL={#MyAppURL}
+DefaultDirName={commonappdata}\obs-studio\plugins
+OutputBaseFilename={#MyAppName}-{#MyAppVersion}-windows-x64-Installer
+Compression=lzma
+SolidCompression=yes
+DirExistsWarning=no
+WizardStyle=modern
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Files]
+; "Package" is the copied release/<Config> tree, which contains the
+; spancam-for-obs module folder (bin\64bit\spancam-for-obs.dll, data\...).
+Source: "Package\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
