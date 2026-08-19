@@ -4,7 +4,13 @@ if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_PROJECT_NAME@.plugin" AND
   file(INSTALL DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/package/Library/Application Support/obs-studio/plugins"
     TYPE DIRECTORY FILES "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_PROJECT_NAME@.plugin" USE_SOURCE_PERMISSIONS)
 
-  if(CMAKE_INSTALL_CONFIG_NAME MATCHES "^([Rr][Ee][Ll][Ee][Aa][Ss][Ee])$" OR CMAKE_INSTALL_CONFIG_NAME MATCHES "^([Mm][Ii][Nn][Ss][Ii][Zz][Ee][Rr][Ee][Ll])$")
+  # Debug symbols deliberately do NOT go into the user's package. They were being copied
+  # into "Library/Application Support/obs-studio/plugins", so every end user installed
+  # ~885 KB of dSYM they can do nothing with, inside a signed+notarized installer. The
+  # symbols are still built and still uploaded as their OWN CI artifact (the -dSYMs
+  # upload in build-project.yaml), which is where a crash report needs them from.
+  # Set SPANCAM_PACKAGE_DSYM=ON to put them back in a local package for debugging.
+  if(SPANCAM_PACKAGE_DSYM AND (CMAKE_INSTALL_CONFIG_NAME MATCHES "^([Rr][Ee][Ll][Ee][Aa][Ss][Ee])$" OR CMAKE_INSTALL_CONFIG_NAME MATCHES "^([Mm][Ii][Nn][Ss][Ii][Zz][Ee][Rr][Ee][Ll])$"))
     if(EXISTS "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_PROJECT_NAME@.plugin.dSYM" AND NOT IS_SYMLINK "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_PROJECT_NAME@.plugin.dSYM")
       file(INSTALL DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/package/Library/Application Support/obs-studio/plugins" TYPE DIRECTORY FILES "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_PROJECT_NAME@.plugin.dSYM" USE_SOURCE_PERMISSIONS)
     endif()

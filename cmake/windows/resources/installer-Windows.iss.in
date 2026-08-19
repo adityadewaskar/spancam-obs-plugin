@@ -27,6 +27,10 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={commonappdata}\obs-studio\plugins
+; This is the x64 build, so refuse anything it cannot serve rather than installing a DLL
+; OBS will never load. x64compatible also covers ARM64 running x64 OBS under emulation.
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 OutputBaseFilename={#MyAppName}-{#MyAppVersion}-windows-x64-Installer
 Compression=lzma
 SolidCompression=yes

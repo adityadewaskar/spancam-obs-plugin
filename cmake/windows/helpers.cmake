@@ -26,7 +26,7 @@ function(set_target_properties_plugin target)
 
   install(
     FILES "$<TARGET_PDB_FILE:${target}>"
-    CONFIGURATIONS RelWithDebInfo Debug Release
+    CONFIGURATIONS RelWithDebInfo Debug
     DESTINATION "${target}/bin/64bit"
     OPTIONAL
   )

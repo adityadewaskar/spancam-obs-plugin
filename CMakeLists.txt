@@ -35,7 +35,14 @@ endif()
 # Winsock, for the sockets on Windows (BSD sockets need no extra link elsewhere).
 if(OS_WINDOWS)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
+endif()
 
+# The macOS block was NESTED inside the OS_WINDOWS block above (its `endif()` was missing, so
+# the two `endif()`s at the bottom closed OS_MACOS and OS_WINDOWS). That made every
+# find_library below dead on macOS — OS_WINDOWS is false there, so the block never ran. It
+# only ever built because OBS's own helpers already pull these frameworks in, which `otool -L`
+# confirms (each one appears twice on the built binary). Working by luck: the day that changes,
+# spancam-vtdec.c and spancam-aoa.c stop linking. gersemi's re-indent is what exposed it.
 if(OS_MACOS)
   # AOA (the cable path) goes through IOUSBLib, the same API the Spancam Mac app
   # uses. Both are macOS system frameworks — nothing is vendored.
@@ -46,9 +53,13 @@ if(OS_MACOS)
   find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
   target_link_libraries(
     ${CMAKE_PROJECT_NAME}
-    PRIVATE ${IOKIT_FRAMEWORK} ${COREFOUNDATION_FRAMEWORK} ${VIDEOTOOLBOX_FRAMEWORK} ${COREMEDIA_FRAMEWORK}
-            ${COREVIDEO_FRAMEWORK})
-endif()
+    PRIVATE
+      ${IOKIT_FRAMEWORK}
+      ${COREFOUNDATION_FRAMEWORK}
+      ${VIDEOTOOLBOX_FRAMEWORK}
+      ${COREMEDIA_FRAMEWORK}
+      ${COREVIDEO_FRAMEWORK}
+  )
 endif()
 
 if(ENABLE_FRONTEND_API)
@@ -69,9 +80,10 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/spancam-source.c
-            src/spancam-aoa.c
-            src/spancam-vtdec.c)
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE src/plugin-main.c src/spancam-source.c src/spancam-aoa.c src/spancam-vtdec.c
+)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 

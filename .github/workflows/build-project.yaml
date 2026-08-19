@@ -48,7 +48,10 @@ jobs:
               fi
               ;;
             workflow_dispatch)
-              config_data=('codesign:true' 'notarize:false' 'package:false' 'config:RelWithDebInfo')
+              # package:true so a manual run actually exercises the INSTALLER path. With it
+              # false, the only thing that ever built a .pkg/.exe/.deb was pushing a real
+              # version tag — i.e. the packaging path could only be tested in production.
+              config_data=('codesign:true' 'notarize:false' 'package:true' 'config:RelWithDebInfo')
               ;;
             schedule)
               config_data=('codesign:true' 'notarize:false' 'package:true' 'config:RelWithDebInfo')
@@ -104,7 +107,7 @@ jobs:
           if (( ${+RUNNER_DEBUG} )) setopt XTRACE
 
           print '::group::Enable Xcode 16.1'
-          sudo xcode-select --switch /Applications/Xcode_16.1.0.app/Contents/Developer
+          sudo xcode-select --switch "$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)/Contents/Developer" || sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
           print '::endgroup::'
 
           print '::group::Clean Homebrew Environment'
@@ -169,9 +172,61 @@ jobs:
           codesignUser: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
           codesignPass: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
 
+      - name: Verify Signature + Notarization 🔒
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        env:
+          WANT_CODESIGN: ${{ needs.check-event.outputs.codesign }}
+          HAVE_CODESIGN: ${{ steps.codesign.outputs.haveCodesignIdent }}
+          WANT_NOTARIZE: ${{ needs.check-event.outputs.notarize }}
+          HAVE_NOTARY: ${{ steps.codesign.outputs.haveNotarizationUser }}
+        run: |
+          : Verify Signature + Notarization 🔒
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          set -euo pipefail
+
+          # WHY THIS EXISTS: the signing gate requires all three of identity, installer
+          # identity and cert. Remove or rename ANY one — cert rotation, a typo, a fork — and
+          # the packaging script falls through to a plain `mv`, uploading an UNSIGNED .pkg
+          # under the identical filename with a green checkmark. On Apple Silicon that plugin
+          # will not load and the .pkg reports itself as damaged. Nothing verified it.
+          if [[ "${WANT_CODESIGN}" == 'true' && "${HAVE_CODESIGN}" != 'true' ]]; then
+            echo "::error::This build was supposed to be signed but no signing identity was" \
+                 "available, so an UNSIGNED package was produced. Check the MACOS_SIGNING_*" \
+                 "secrets — all of IDENTITY, INSTALLER_IDENTITY and CERT must be present."
+            exit 1
+          fi
+          if [[ "${WANT_NOTARIZE}" == 'true' && "${HAVE_NOTARY}" != 'true' ]]; then
+            echo "::error::This build was supposed to be notarized but the notarization" \
+                 "credentials were missing, so an un-notarized package was produced under the" \
+                 "same filename. Check MACOS_NOTARIZATION_USERNAME / _PASSWORD."
+            exit 1
+          fi
+
+          pkg=(${{ github.workspace }}/release/*.pkg)
+          if (( ${#pkg[@]} == 0 )) || [[ ! -f "${pkg[1]:-${pkg[0]}}" ]]; then
+            echo "::notice::No .pkg produced (not a packaging build) — nothing to verify."
+            exit 0
+          fi
+          target="${pkg[1]:-${pkg[0]}}"
+          echo "Verifying ${target##*/}"
+
+          if [[ "${HAVE_CODESIGN}" == 'true' ]]; then
+            # Does the system consider this installer trustworthy for install?
+            spctl -a -vvv -t install "${target}"
+          fi
+          if [[ "${WANT_NOTARIZE}" == 'true' ]]; then
+            # Is the notarization ticket actually STAPLED? Notarization that "succeeded" but
+            # failed to staple leaves a package that needs the network to validate.
+            xcrun stapler validate -v "${target}"
+          fi
+
       - name: Upload Artifacts 📡
         uses: actions/upload-artifact@v4
         with:
+          # An empty artifact must FAIL the job. Left at the default
+          # `warn`, a packaging step that produced nothing still went
+          # green and the release simply came out missing a platform.
+          if-no-files-found: error
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal.*
 
@@ -179,6 +234,10 @@ jobs:
         uses: actions/upload-artifact@v4
         if: ${{ needs.check-event.outputs.config == 'Release' }}
         with:
+          # An empty artifact must FAIL the job. Left at the default
+          # `warn`, a packaging step that produced nothing still went
+          # green and the release simply came out missing a platform.
+          if-no-files-found: error
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal-${{ needs.check-event.outputs.commitHash }}-dSYMs
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal-dSYMs.*
 
@@ -240,12 +299,20 @@ jobs:
       - name: Upload Source Tarball 🗜️
         uses: actions/upload-artifact@v4
         with:
+          # An empty artifact must FAIL the job. Left at the default
+          # `warn`, a packaging step that produced nothing still went
+          # green and the release simply came out missing a platform.
+          if-no-files-found: error
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-${{ matrix.os }}-sources-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-source.*
 
       - name: Upload Artifacts 📡
         uses: actions/upload-artifact@v4
         with:
+          # An empty artifact must FAIL the job. Left at the default
+          # `warn`, a packaging step that produced nothing still went
+          # green and the release simply came out missing a platform.
+          if-no-files-found: error
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-${{ matrix.os }}-x86_64-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-x86_64*.*
 
@@ -253,6 +320,10 @@ jobs:
         uses: actions/upload-artifact@v4
         if: ${{ fromJSON(needs.check-event.outputs.package) }}
         with:
+          # An empty artifact must FAIL the job. Left at the default
+          # `warn`, a packaging step that produced nothing still went
+          # green and the release simply came out missing a platform.
+          if-no-files-found: error
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-${{ matrix.os }}-x86_64-${{ needs.check-event.outputs.commitHash }}-dbgsym
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-x86_64*-dbgsym.ddeb
 
@@ -303,8 +374,55 @@ jobs:
           config: ${{ needs.check-event.outputs.config }}
           package: ${{ fromJSON(needs.check-event.outputs.package) }}
 
+      - name: Sign Windows Binaries 🔑
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        env:
+          WIN_CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          WIN_CERT_PASS: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          # Sign Windows Binaries 🔑
+          if ( $Env:RUNNER_DEBUG -ne $null ) { Set-PSDebug -Trace 1 }
+
+          # Unsigned Windows binaries are the single biggest trust problem in this pipeline:
+          # SmartScreen shows a full-screen block, the browser calls the download uncommon, and
+          # UAC says "Publisher: Unknown". So say so LOUDLY rather than shipping quietly.
+          if ( [string]::IsNullOrEmpty($Env:WIN_CERT) ) {
+            Write-Output "::warning title=Windows build is UNSIGNED::No WINDOWS_SIGNING_CERT secret. Users will see SmartScreen and 'Publisher: Unknown'. Add WINDOWS_SIGNING_CERT (base64 .pfx) + WINDOWS_SIGNING_CERT_PASSWORD, or switch to Azure Trusted Signing."
+            exit 0
+          }
+
+          $pfx = Join-Path $Env:RUNNER_TEMP 'spancam-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($Env:WIN_CERT))
+
+          $signtool = Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10\bin' `
+            -Recurse -Filter 'signtool.exe' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1 -ExpandProperty FullName
+          if ( -not $signtool ) { throw 'signtool.exe not found on the runner' }
+
+          # Sign the DLL *and* the installer. The DLL matters on its own because the .zip is a
+          # distribution path too, and an installer that drops an unsigned DLL still trips
+          # SmartScreen later. RFC-3161 timestamp so signatures outlive the certificate.
+          $targets = @()
+          $targets += Get-ChildItem -Path 'release' -Recurse -Include '*.dll' -ErrorAction SilentlyContinue
+          $targets += Get-ChildItem -Path 'release' -Recurse -Include '*.exe' -ErrorAction SilentlyContinue
+          foreach ( $t in $targets ) {
+            & $signtool sign /f $pfx /p $Env:WIN_CERT_PASS `
+              /fd sha256 /tr 'http://timestamp.digicert.com' /td sha256 /v $t.FullName
+            if ( $LASTEXITCODE -ne 0 ) { throw "signtool failed for $($t.FullName)" }
+          }
+          Remove-Item $pfx -Force
+
+          foreach ( $t in $targets ) {
+            & $signtool verify /pa /v $t.FullName
+            if ( $LASTEXITCODE -ne 0 ) { throw "signature verification failed for $($t.FullName)" }
+          }
+
       - name: Upload Artifacts 📡
         uses: actions/upload-artifact@v4
         with:
+          # An empty artifact must FAIL the job. Left at the default
+          # `warn`, a packaging step that produced nothing still went
+          # green and the release simply came out missing a platform.
+          if-no-files-found: error
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64*.*
