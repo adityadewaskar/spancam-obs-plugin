@@ -20,6 +20,8 @@
 AppId={{206330B4-714C-42A2-B2AC-A7F35B242AFC}
 AppName=Spancam for OBS
 AppVersion={#MyAppVersion}
+AppVerName=Spancam for OBS {#MyAppVersion}
+UninstallDisplayName=Spancam for OBS
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
