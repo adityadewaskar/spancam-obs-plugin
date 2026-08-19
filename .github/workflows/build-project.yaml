@@ -181,44 +181,46 @@ jobs:
           HAVE_NOTARY: ${{ steps.codesign.outputs.haveNotarizationUser }}
         run: |
           : Verify Signature + Notarization 🔒
-          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          set -euo pipefail
+          if (( ${+RUNNER_DEBUG} )) setopt xtrace
+          # This job's shell is zsh --errexit, where an UNMATCHED GLOB is a fatal error, so the
+          # .pkg lookup below needs null_glob rather than a bash-style existence test.
+          setopt local_options null_glob
 
-          # WHY THIS EXISTS: the signing gate requires all three of identity, installer
-          # identity and cert. Remove or rename ANY one — cert rotation, a typo, a fork — and
-          # the packaging script falls through to a plain `mv`, uploading an UNSIGNED .pkg
-          # under the identical filename with a green checkmark. On Apple Silicon that plugin
-          # will not load and the .pkg reports itself as damaged. Nothing verified it.
-          if [[ "${WANT_CODESIGN}" == 'true' && "${HAVE_CODESIGN}" != 'true' ]]; then
-            echo "::error::This build was supposed to be signed but no signing identity was" \
-                 "available, so an UNSIGNED package was produced. Check the MACOS_SIGNING_*" \
-                 "secrets — all of IDENTITY, INSTALLER_IDENTITY and CERT must be present."
+          # WHY THIS EXISTS: the signing gate requires all three of identity, installer identity
+          # and cert. Remove or rename ANY one — cert rotation, a typo, a fork — and
+          # package-macos falls through to a plain `mv`, uploading an UNSIGNED .pkg under the
+          # identical filename with a green checkmark. On Apple Silicon that plugin will not load
+          # and the .pkg reports itself damaged. Nothing verified it before.
+          if [[ ${WANT_CODESIGN} == 'true' && ${HAVE_CODESIGN} != 'true' ]] {
+            print "::error::Build was meant to be SIGNED but no identity was available, so an" \
+                  "UNSIGNED package was produced. All of MACOS_SIGNING_APPLICATION_IDENTITY," \
+                  "MACOS_SIGNING_INSTALLER_IDENTITY and MACOS_SIGNING_CERT must be present."
             exit 1
-          fi
-          if [[ "${WANT_NOTARIZE}" == 'true' && "${HAVE_NOTARY}" != 'true' ]]; then
-            echo "::error::This build was supposed to be notarized but the notarization" \
-                 "credentials were missing, so an un-notarized package was produced under the" \
-                 "same filename. Check MACOS_NOTARIZATION_USERNAME / _PASSWORD."
+          }
+          if [[ ${WANT_NOTARIZE} == 'true' && ${HAVE_NOTARY} != 'true' ]] {
+            print "::error::Build was meant to be NOTARIZED but the credentials were missing," \
+                  "so an un-notarized package was produced under the same filename. Check" \
+                  "MACOS_NOTARIZATION_USERNAME / MACOS_NOTARIZATION_PASSWORD."
             exit 1
-          fi
+          }
 
-          pkg=(${{ github.workspace }}/release/*.pkg)
-          if (( ${#pkg[@]} == 0 )) || [[ ! -f "${pkg[1]:-${pkg[0]}}" ]]; then
-            echo "::notice::No .pkg produced (not a packaging build) — nothing to verify."
+          local -a pkgs=(${{ github.workspace }}/release/*.pkg)
+          if (( ! ${#pkgs} )) {
+            print '::notice::No .pkg in release/ — nothing to verify.'
             exit 0
-          fi
-          target="${pkg[1]:-${pkg[0]}}"
-          echo "Verifying ${target##*/}"
+          }
+          local target=${pkgs[1]}   # zsh arrays are 1-based
+          print "Verifying ${target:t}"
 
-          if [[ "${HAVE_CODESIGN}" == 'true' ]]; then
-            # Does the system consider this installer trustworthy for install?
-            spctl -a -vvv -t install "${target}"
-          fi
-          if [[ "${WANT_NOTARIZE}" == 'true' ]]; then
-            # Is the notarization ticket actually STAPLED? Notarization that "succeeded" but
-            # failed to staple leaves a package that needs the network to validate.
-            xcrun stapler validate -v "${target}"
-          fi
+          if [[ ${HAVE_CODESIGN} == 'true' ]] {
+            # Would the SYSTEM accept this installer? Catches a mis-signed or partially signed pkg.
+            spctl -a -vvv -t install ${target}
+          }
+          if [[ ${WANT_NOTARIZE} == 'true' ]] {
+            # Is the ticket actually STAPLED? Notarization that succeeded but failed to staple
+            # leaves a package that needs the network to validate on the user's machine.
+            xcrun stapler validate -v ${target}
+          }
 
       - name: Upload Artifacts 📡
         uses: actions/upload-artifact@v4
