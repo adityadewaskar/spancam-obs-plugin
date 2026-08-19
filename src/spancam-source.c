@@ -215,6 +215,10 @@ struct spancam_source {
 	bool promote_now;
 	/// Consecutive USB attempts that connected but never streamed. Backs off the probe.
 	int promote_fails;
+	/// Signalled on a show/hide edge so the idle wait wakes immediately.
+	os_event_t *wake;
+	/// True while parked because the source is hidden (drives the one-shot log lines).
+	bool idled;
 
 #if defined(SPANCAM_USE_VTDEC)
 	spancam_vtdec_t *vtdec;
@@ -1882,10 +1886,58 @@ static int spancam_redial_ms(int redials)
 	return redials >= rungs ? ladder[rungs - 1] : ladder[redials];
 }
 
+// Stop dialling while the source is neither on-screen nor in the program feed.
+//
+// The receive thread used to run from create to destroy, so a Spancam source sitting in an
+// inactive scene kept a phone streaming: its camera stayed lit (privacy indicator on), its
+// battery drained, its encoder ran, and this end decoded every frame — for a source nobody
+// could see. It also meant a phone could be held by a hidden source while the user wondered
+// why the scene they were looking at could not have it.
+//
+// Keyed on active OR showing, deliberately: `active` is the program feed, `showing` covers
+// the multiview and the properties preview, and a preview-only workflow must keep working.
+static bool spancam_should_run(struct spancam_source *ctx)
+{
+	return obs_source_active(ctx->source) || obs_source_showing(ctx->source);
+}
+
+// OBS calls these on the show/hide and activate/deactivate edges. Nothing to do but wake the
+// loop: it re-checks spancam_should_run itself, so the edge only needs to interrupt the wait.
+static void spancam_source_show(void *data)
+{
+	struct spancam_source *ctx = data;
+	os_event_signal(ctx->wake);
+}
+
+static void spancam_source_hide(void *data)
+{
+	struct spancam_source *ctx = data;
+	os_event_signal(ctx->wake);
+}
+
 static void *spancam_receive_loop(void *data)
 {
 	struct spancam_source *ctx = data;
 	while (os_event_try(ctx->stop_signal) == EAGAIN) {
+		if (!spancam_should_run(ctx)) {
+			// Idle: release the phone and wait to be shown again. Logged once per
+			// transition so the OBS log explains a source that stopped on purpose.
+			if (!ctx->idled) {
+				ctx->idled = true;
+				obs_log(LOG_INFO,
+					"Spancam[%s]: source hidden — releasing the phone's camera",
+					obs_source_get_name(ctx->source));
+			}
+			os_event_reset(ctx->wake);
+			os_event_timedwait(ctx->wake, 500);
+			continue;
+		}
+		if (ctx->idled) {
+			ctx->idled = false;
+			obs_log(LOG_INFO, "Spancam[%s]: source visible again — reconnecting",
+				obs_source_get_name(ctx->source));
+			ctx->redials = 0; // a deliberate resume is not a failure
+		}
 		spancam_stream_once(ctx);
 		int wait = spancam_redial_ms(ctx->redials);
 		if (ctx->promote_now) {
@@ -2113,6 +2165,7 @@ static void *spancam_source_create(obs_data_t *settings, obs_source_t *source)
 	ctx->ctrl_fd = SPANCAM_BAD_SOCKET; // no control socket until a connection is live
 	pthread_mutex_init(&ctx->cfg_lock, NULL);
 	os_event_init(&ctx->stop_signal, OS_EVENT_TYPE_MANUAL);
+	os_event_init(&ctx->wake, OS_EVENT_TYPE_MANUAL);
 	spancam_source_update(ctx, settings);
 	// Track renames so the "Name" field never holds a stale value (see spancam_sync_label).
 	signal_handler_connect(obs_source_get_signal_handler(source), "rename", spancam_renamed, ctx);
@@ -2127,9 +2180,11 @@ static void spancam_source_destroy(void *data)
 	signal_handler_disconnect(obs_source_get_signal_handler(ctx->source), "rename", spancam_renamed, ctx);
 	if (ctx->thread_running) {
 		os_event_signal(ctx->stop_signal);
+		os_event_signal(ctx->wake); // break the idle wait immediately
 		pthread_join(ctx->thread, NULL);
 	}
 	os_event_destroy(ctx->stop_signal);
+	os_event_destroy(ctx->wake);
 	pthread_mutex_destroy(&ctx->cfg_lock);
 	bfree(ctx->host);
 	bfree(ctx->token);
@@ -2146,5 +2201,9 @@ struct obs_source_info spancam_source_info = {
 	.update = spancam_source_update,
 	.get_defaults = spancam_source_get_defaults,
 	.get_properties = spancam_source_get_properties,
+	.show = spancam_source_show,
+	.hide = spancam_source_hide,
+	.activate = spancam_source_show,
+	.deactivate = spancam_source_hide,
 	.icon_type = OBS_ICON_TYPE_CAMERA,
 };
