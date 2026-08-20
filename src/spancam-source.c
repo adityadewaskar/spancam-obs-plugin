@@ -1936,25 +1936,24 @@ static void *spancam_receive_loop(void *data)
 				obs_source_get_name(ctx->source));
 			ctx->redials = 0; // a deliberate resume is not a failure
 		}
-		// Nothing picked in the Phone dropdown: that is a configuration state, known
-		// right now, not a connection that has to time out first. Show the setup card
-		// immediately — OBS renders an async source with no frame as nothing at all, so
-		// the alternative is a blank rectangle that explains nothing.
+		// ANY time this source has no live video, the user gets the card. No phone
+		// picked, a phone that is not on the network, a phone that just dropped — from
+		// where they are sitting these are one situation: nothing is on screen and they
+		// need to be told what to do about it.
 		//
-		// An unpinned source can still auto-connect over a cable or by discovery, and
-		// that is fine: real frames replace this card the moment they arrive.
-		pthread_mutex_lock(&ctx->cfg_lock);
-		bool unpinned = !ctx->device || !*ctx->device;
-		pthread_mutex_unlock(&ctx->cfg_lock);
-		if (unpinned)
+		// Pushed BEFORE the dial as well as after, because a dial to an unreachable
+		// phone blocks on connect for seconds, and earlier versions of this showed a
+		// black rectangle for that whole time. Also note a FAILED dial never reaches the
+		// disconnect path further down, so posting the card only there left exactly the
+		// most common case — a phone that is simply not there — showing nothing at all.
+		if (spancam_should_run(ctx))
 			spancam_placeholder_output(ctx->source);
 
 		spancam_stream_once(ctx);
 
-		// Pinned to a phone that is not answering. Here the card has to wait: a source
-		// mid-stream that drops for two seconds would otherwise flash "No phone
-		// connected" over a live shot, which is alarming and usually wrong.
-		if (!unpinned && spancam_should_run(ctx) && ctx->redials >= 3)
+		// stream_once only ever returns when there is no video: the dial failed, or the
+		// connection it had just ended. Either way, put the card back up.
+		if (spancam_should_run(ctx))
 			spancam_placeholder_output(ctx->source);
 
 		int wait = spancam_redial_ms(ctx->redials);
