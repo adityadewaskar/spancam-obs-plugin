@@ -5,6 +5,15 @@ on:
       pluginName:
         description: Project name detected by parsing build spec file
         value: ${{ jobs.check-event.outputs.pluginName }}
+      version:
+        description: Version from buildspec.json — the single source of truth
+        value: ${{ jobs.check-event.outputs.version }}
+      release:
+        description: Whether this push should become a release
+        value: ${{ jobs.check-event.outputs.release }}
+      prerelease:
+        description: Whether the buildspec version is a -beta/-rc
+        value: ${{ jobs.check-event.outputs.prerelease }}
 jobs:
   check-event:
     name: Check GitHub Event Data 🔎
@@ -19,6 +28,9 @@ jobs:
       config: ${{ steps.setup.outputs.config }}
       commitHash: ${{ steps.setup.outputs.commitHash }}
       pluginName: ${{ steps.setup.outputs.pluginName }}
+      version: ${{ steps.setup.outputs.version }}
+      release: ${{ steps.setup.outputs.release }}
+      prerelease: ${{ steps.setup.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,6 +43,42 @@ jobs:
           : Check Event Data ☑️
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
 
+          # buildspec.json is the ONLY place a version is written. Bump "version", push to
+          # main, and if no release exists for it yet this push becomes that release — no tag
+          # to cut by hand. It deliberately does NOT work by auto-pushing a tag: a tag pushed
+          # with GITHUB_TOKEN does not trigger workflows, so that would create the tag and
+          # then build nothing. action-gh-release creates the tag itself, as part of creating
+          # the release, so no tag-push event is needed at all.
+          spec_version="$(jq -r '.version' buildspec.json)"
+          echo "version=${spec_version}" >> $GITHUB_OUTPUT
+          case "${spec_version}" in
+            *-beta*|*-rc*) echo 'prerelease=true' >> $GITHUB_OUTPUT ;;
+            *)             echo 'prerelease=false' >> $GITHUB_OUTPUT ;;
+          esac
+
+          release=false
+          if [[ "${GITHUB_EVENT_NAME}" == 'push' ]]; then
+            if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
+              # Tags still work, for re-cutting a release by hand, but must agree with the spec
+              # or the release would ship installers named after a different version.
+              case "${GITHUB_REF_NAME}" in
+                "${spec_version}"|"${spec_version}"-beta*|"${spec_version}"-rc*) release=true ;;
+                *)
+                  echo "::error::Tag '${GITHUB_REF_NAME}' does not match version '${spec_version}' in buildspec.json. Bump \"version\" in buildspec.json and push to main — the tag is created for you."
+                  exit 1
+                  ;;
+              esac
+            elif [[ "${GITHUB_REF_NAME}" == 'main' || "${GITHUB_REF_NAME}" == 'master' ]]; then
+              if gh release view "${spec_version}" >/dev/null 2>&1; then
+                echo "Release ${spec_version} already exists — ordinary push, not a release."
+              else
+                echo "::notice::No release for buildspec version ${spec_version} yet — this push becomes it."
+                release=true
+              fi
+            fi
+          fi
+          echo "release=${release}" >> $GITHUB_OUTPUT
+
           case "${GITHUB_EVENT_NAME}" in
             pull_request)
               config_data=('codesign:false' 'notarize:false' 'package:false' 'config:RelWithDebInfo')
@@ -42,7 +90,7 @@ jobs:
               ;;
             push)
               config_data=('codesign:true' 'notarize:false' 'package:true' 'config:RelWithDebInfo')
-              if [[ ${GITHUB_REF_NAME} =~ [0-9]+.[0-9]+.[0-9]+(-(rc|beta).+)? ]]; then
+              if [[ "${release}" == 'true' ]]; then
                 config_data[1]='notarize:true'
                 config_data[3]='config:Release'
               fi
@@ -67,19 +115,6 @@ jobs:
 
           plugin_name="$(grep 'name' buildspec.json | sed -E -e 's/^.+"name":[^"]+"(.+)",?$/\1/g')"
           plugin_display_name="$(grep 'displayName' buildspec.json | sed -E -e 's/^.+"displayName":[^"]+"(.+)",?$/\1/g' || echo "")"
-
-          # A release tag must match the version in buildspec.json, otherwise the
-          # release would ship installer files named after a different version.
-          if [[ "${GITHUB_EVENT_NAME}" == 'push' && "${GITHUB_REF_TYPE}" == 'tag' ]]; then
-            spec_version="$(jq -r '.version' buildspec.json)"
-            case "${GITHUB_REF_NAME}" in
-              "${spec_version}"|"${spec_version}"-beta*|"${spec_version}"-rc*) ;;
-              *)
-                echo "::error::Tag '${GITHUB_REF_NAME}' does not match version '${spec_version}' in buildspec.json. Bump \"version\" in buildspec.json, commit, and re-tag."
-                exit 1
-                ;;
-            esac
-          fi
 
           if [[ "${plugin_display_name}" ]]; then
             echo "pluginName=${plugin_display_name}" >> $GITHUB_OUTPUT

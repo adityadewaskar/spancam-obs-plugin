@@ -33,50 +33,19 @@ jobs:
 
   create-release:
     name: Create Release 🛫
-    if: github.ref_type == 'tag'
+    # Driven by buildspec.json: check-event says whether this push is a release.
+    if: needs.build-project.outputs.release == 'true'
     runs-on: ubuntu-24.04
     needs: build-project
     defaults:
       run:
         shell: bash
     steps:
-      - name: Check Release Tag ☑️
-        id: check
-        run: |
-          : Check Release Tag ☑️
-          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
-
-          case "${GITHUB_REF_NAME}" in
-            +([0-9]).+([0-9]).+([0-9]) )
-              echo 'validTag=true' >> $GITHUB_OUTPUT
-              echo 'prerelease=false' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-              ;;
-            +([0-9]).+([0-9]).+([0-9])-@(beta|rc)?(.)*([0-9]) )
-              echo 'validTag=true' >> $GITHUB_OUTPUT
-              echo 'prerelease=true' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-              ;;
-            *) echo 'validTag=false' >> $GITHUB_OUTPUT ;;
-          esac
-
-      - name: Reject Unrecognised Tag 🚫
-        if: ${{ !fromJSON(steps.check.outputs.validTag) }}
-        run: |
-          : Reject Unrecognised Tag 🚫
-          echo "::error::Tag '${GITHUB_REF_NAME}' is not a release version." \
-               "Every later step is gated on validTag, so this run would otherwise report SUCCESS" \
-               "while creating no release at all — the failure mode that hides a broken release."
-          exit 1
-
       - name: Download Build Artifacts 📥
         uses: actions/download-artifact@v4
-        if: fromJSON(steps.check.outputs.validTag)
         id: download
 
       - name: Rename Files 🏷️
-        if: fromJSON(steps.check.outputs.validTag)
         run: |
           : Rename Files 🏷️
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
@@ -104,7 +73,6 @@ jobs:
           done
 
       - name: Generate Checksums 🪪
-        if: fromJSON(steps.check.outputs.validTag)
         run: |
           : Generate Checksums 🪪
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
@@ -116,7 +84,6 @@ jobs:
           done
 
       - name: Resolve Release Assets 🧭
-        if: fromJSON(steps.check.outputs.validTag)
         run: |
           : Resolve Release Assets 🧭
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
@@ -127,7 +94,7 @@ jobs:
           # go any further if an installer is missing. This runs BEFORE Create Release on
           # purpose: the release is published outright, so a check that ran afterwards would
           # only complain about something users could already download.
-          version='${{ steps.check.outputs.version }}'
+          version='${{ needs.build-project.outputs.version }}'
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${version}"
 
           win_exe='' win_zip='' mac_pkg='' linux_deb='' linux_tar=''
@@ -164,7 +131,6 @@ jobs:
           } >> "${GITHUB_ENV}"
 
       - name: Clear Stale Release Assets 🧹
-        if: fromJSON(steps.check.outputs.validTag)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -176,7 +142,7 @@ jobs:
           # publishable, and wrong. Delete the whole existing release for this tag so the upload
           # below is the only thing on it. A DRAFT carries no public URL, so nothing breaks; a
           # published release is left alone rather than yanked from under anyone.
-          tag='${{ steps.check.outputs.version }}'
+          tag='${{ needs.build-project.outputs.version }}'
           if ! state=$(gh release view "${tag}" --json isDraft -q .isDraft 2>/dev/null); then
             echo "No existing release for ${tag} — nothing to clear."
           elif [[ "${state}" == 'true' ]]; then
@@ -195,7 +161,6 @@ jobs:
           fi
 
       - name: Compose Release Notes 📝
-        if: fromJSON(steps.check.outputs.validTag)
         run: |
           : Compose Release Notes 📝
           notes="${{ github.workspace }}/RELEASE_NOTES.md"
@@ -214,7 +179,6 @@ jobs:
           } > "${notes}"
 
       - name: Create Release 🛫
-        if: fromJSON(steps.check.outputs.validTag)
         id: create_release
         # v3.0.2 (commit verified against the tag object via the API, not copied on trust).
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
@@ -223,9 +187,12 @@ jobs:
           # could eyeball the assets, but that made every release a two-part job where the
           # download links stayed 404 until someone remembered to click publish.
           draft: false
-          prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
-          tag_name: ${{ steps.check.outputs.version }}
-          name: ${{ needs.build-project.outputs.pluginName }} ${{ steps.check.outputs.version }}
+          prerelease: ${{ fromJSON(needs.build-project.outputs.prerelease) }}
+          # The tag usually does NOT exist yet: bumping buildspec.json and pushing to main
+          # is the whole release ritual, and this API call is what creates the tag.
+          tag_name: ${{ needs.build-project.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.build-project.outputs.pluginName }} ${{ needs.build-project.outputs.version }}
           body_path: ${{ github.workspace }}/RELEASE_NOTES.md
           # A pattern that matches nothing must fail rather than quietly shipping a release
           # that is missing a platform.
@@ -239,7 +206,6 @@ jobs:
             ${{ github.workspace }}/*.tar.xz
 
       - name: Print Download Links 🔗
-        if: fromJSON(steps.check.outputs.validTag)
         run: |
           : Print Download Links 🔗
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
@@ -249,7 +215,7 @@ jobs:
           # five versioned URLs, and a typo there is a dead download button that nothing in CI
           # would ever catch. So print the block ready to paste. URLs come from
           # Resolve Release Assets, which already proved every installer exists.
-          version='${{ steps.check.outputs.version }}'
+          version='${{ needs.build-project.outputs.version }}'
           win_exe="${WIN_EXE}" win_zip="${WIN_ZIP}" mac_pkg="${MAC_PKG}"
           linux_deb="${LINUX_DEB}" linux_tar="${LINUX_TAR}"
 
