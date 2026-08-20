@@ -221,6 +221,9 @@ struct spancam_source {
 	os_event_t *wake;
 	/// True while parked because the source is hidden (drives the one-shot log lines).
 	bool idled;
+	// Phones seen by the last device scan, so the "install the app" hint in the
+	// properties dialog can appear only when there is genuinely nothing to pick.
+	int last_scan_n;
 
 #if defined(SPANCAM_USE_VTDEC)
 	spancam_vtdec_t *vtdec;
@@ -2066,9 +2069,20 @@ static void spancam_fill_devices(struct spancam_source *ctx, obs_property_t *lis
 		obs_property_list_add_string(list, label.array, pinned);
 		dstr_free(&label);
 	}
+	ctx->last_scan_n = n;
 	obs_log(LOG_INFO, "Spancam[%s]: device scan found %d phone(s), pinned=\"%s\"%s",
 		obs_source_get_name(ctx->source), n, pinned, (*pinned && !pinned_listed) ? " (not reachable)" : "");
 	bfree(pinned);
+}
+
+// The hint is only shown when the dropdown has nothing real in it. An always-on line of
+// text next to a working dropdown is noise; the same line when the list is empty is the
+// only thing on screen that says a phone app exists at all.
+static void spancam_sync_getapp(obs_properties_t *props, struct spancam_source *ctx)
+{
+	obs_property_t *hint = obs_properties_get(props, "getapp");
+	if (hint && ctx)
+		obs_property_set_visible(hint, ctx->last_scan_n == 0);
 }
 
 // "Refresh" re-scans. A scan takes about a second (UDP window + Bonjour resolve), so it
@@ -2079,6 +2093,7 @@ static bool spancam_refresh_clicked(obs_properties_t *props, obs_property_t *p, 
 	obs_property_t *list = obs_properties_get(props, "device");
 	if (list)
 		spancam_fill_devices((struct spancam_source *)data, list);
+	spancam_sync_getapp(props, (struct spancam_source *)data);
 	return true;
 }
 
@@ -2105,6 +2120,14 @@ static obs_properties_t *spancam_source_get_properties(void *data)
 	spancam_fill_devices((struct spancam_source *)data, dev);
 	obs_properties_add_button2(props, "refresh", obs_module_text("Spancam.Prop.Refresh"), spancam_refresh_clicked,
 				   data);
+
+	// Nothing in the properties dialog can render an image — there is no image property
+	// type, and the source-list icon comes from the fixed obs_icon_type enum — so the
+	// branding lives on the idle card in the canvas instead. What CAN go here is the
+	// thing a stuck user actually needs: where to get the phone app. Hidden whenever the
+	// scan found something, so it never nags someone whose phone is already listed.
+	obs_properties_add_text(props, "getapp", obs_module_text("Spancam.Prop.GetApp"), OBS_TEXT_INFO);
+	spancam_sync_getapp(props, sctx);
 
 	obs_property_t *conn = obs_properties_add_list(props, "connection", obs_module_text("Spancam.Prop.Connection"),
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
