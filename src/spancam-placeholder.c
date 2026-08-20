@@ -306,6 +306,17 @@ static bool spancam_compose(const struct spcp_card *card, uint32_t canvas_w, uin
 	return true;
 }
 
+bool spancam_placeholder_stale(void)
+{
+	/* Nothing composed yet is not stale — the ordinary path will compose it. */
+	if (!s_frame)
+		return false;
+	struct obs_video_info ovi;
+	if (!obs_get_video_info(&ovi))
+		return false;
+	return ovi.base_width != s_for_canvas_w || ovi.base_height != s_for_canvas_h;
+}
+
 void spancam_placeholder_output(obs_source_t *source)
 {
 	if (!s_cards[SPCP_LANDSCAPE].px && !s_cards[SPCP_PORTRAIT].px && !spancam_placeholder_init())

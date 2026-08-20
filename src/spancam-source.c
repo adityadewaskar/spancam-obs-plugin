@@ -1966,7 +1966,20 @@ static void *spancam_receive_loop(void *data)
 				"Spancam: %d redials with no video — backing off to %d s; "
 				"the phone is not reachable, check it is on this network and Discoverable",
 				ctx->redials, wait / 1000);
-		os_event_timedwait(ctx->stop_signal, wait);
+		// Wait out the redial ladder in SLICES. The card is composed for one specific
+		// canvas, and the ladder backs off to 60 s — so a single long sleep meant that
+		// changing the canvas resolution, or flipping it to vertical, left a
+		// wrongly-shaped card on screen for up to a minute. Re-push only once the
+		// composition has actually gone stale, so the normal case costs two integer
+		// compares per slice and no frame traffic at all.
+		int left = wait;
+		while (left > 0 && os_event_try(ctx->stop_signal) == EAGAIN) {
+			const int slice = left > 500 ? 500 : left;
+			os_event_timedwait(ctx->stop_signal, slice);
+			left -= slice;
+			if (spancam_should_run(ctx) && spancam_placeholder_stale())
+				spancam_placeholder_output(ctx->source);
+		}
 	}
 	return NULL;
 }

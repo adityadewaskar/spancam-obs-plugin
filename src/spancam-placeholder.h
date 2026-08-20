@@ -44,3 +44,8 @@ void spancam_placeholder_free(void);
 
 /* Pushes the card as this source's current frame. No-op when the asset failed to load. */
 void spancam_placeholder_output(obs_source_t *source);
+
+/* True when the card on screen was composed for a different canvas than the one now
+ * configured — i.e. the user changed resolution or flipped orientation while the card was
+ * showing, and it needs re-composing. Cheap: two integer compares. */
+bool spancam_placeholder_stale(void);
