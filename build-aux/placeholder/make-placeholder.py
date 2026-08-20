@@ -17,10 +17,15 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 HERE = pathlib.Path(__file__).resolve().parent
 EMIT = HERE / "emit_qr"
-PREVIEW = HERE / "no-phone-preview.png"            # human-viewable design output
-OUT = ROOT / "data" / "images" / "no-phone.bin"    # what actually ships
+# Two layouts, because one does not survive both orientations: a landscape card centred
+# in a 1080x1920 canvas leaves most of the width empty and the text ends up small. The
+# plugin picks by canvas aspect at runtime.
+LAYOUTS = ("landscape", "portrait")
 
-W, H = 1280, 720
+# The CARD only — no surrounding canvas. The plugin composes this onto a
+# background sized to the OBS canvas, so one asset serves any resolution or
+# orientation and the text never gets letterboxed down to illegibility.
+W, H = 1040, 470
 BG = (18, 18, 22)
 CARD = (28, 28, 34)
 EDGE = (58, 58, 68)
@@ -62,69 +67,124 @@ def font(sz, bold=False):
     return ImageFont.load_default()
 
 
-def main():
-    if not EMIT.exists():
-        sys.exit(f"missing {EMIT} — build it first (see docstring)")
+STEPS = (
+    "Scan the code and install Spancam.",
+    "Open it and turn on Discoverable.",
+    "Join the same Wi-Fi, or plug in USB.",
+    "In OBS, click Refresh and pick the phone.",
+)
+MARK = HERE / "spancam-mark.png"   # extracted from cmake/macos/resources/spancam.icns
+BRAND = "Spancam for OBS"
+TITLE = "No phone connected"
+SUB = "Scan to install Spancam on your phone."
+FOOTER = "adewaskar.com/apps/spancam"
+
+
+def card(orientation):
+    """Draw the card for one orientation and return the image."""
+    pad = 44
+    if orientation == "landscape":
+        W, H, qpx = 1040, 500, 300
+    else:
+        W, H, qpx = 760, 900, 340
+
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
+    d.rounded_rectangle([1, 1, W - 2, H - 2], radius=22, fill=CARD, outline=EDGE, width=2)
 
-    x0, y0, x1, y1 = 90, 96, W - 90, H - 96
-    d.rounded_rectangle([x0, y0, x1, y1], radius=22, fill=CARD, outline=EDGE, width=2)
+    def brand(x, y, centred):
+        """Icon + wordmark. Rounded like the app icon is everywhere else."""
+        size = 34
+        mark = Image.open(MARK).convert("RGBA").resize((size, size), Image.LANCZOS)
+        r = int(size * 0.26)
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1], radius=r, fill=255)
+        fnt = font(21, True)
+        tw = d.textlength(BRAND, font=fnt)
+        total = size + 12 + tw
+        bx = (W - total) / 2 if centred else x
+        img.paste(mark, (int(bx), y), mask)
+        d.text((bx + size + 12, y + 6), BRAND, font=fnt, fill=FG)
+        return size
 
-    # one large code — this is read off a monitor, often from a metre away
-    qpx = 300
-    qx, qy = x0 + 52, y0 + 88
-    d.rounded_rectangle([qx - 14, qy - 14, qx + qpx + 14, qy + qpx + 14], radius=12,
-                        fill=(255, 255, 255))
-    img.paste(qr_image(DOWNLOAD_URL, qpx), (qx, qy))
+    def qr_block(x, y):
+        d.rounded_rectangle([x - 12, y - 12, x + qpx + 12, y + qpx + 12], radius=12,
+                            fill=(255, 255, 255))
+        img.paste(qr_image(DOWNLOAD_URL, qpx), (x, y))
 
-    tx = qx + qpx + 78
-    d.text((tx, y0 + 76), "No phone connected", font=font(46, True), fill=FG)
-    d.text((tx, y0 + 140), "Scan to install Spancam on your phone.", font=font(24), fill=DIM)
+    if orientation == "landscape":
+        # code on the left, everything else in a column beside it
+        qr_block(pad, (H - qpx) // 2)
+        tx = pad + qpx + 62
+        centre = False
+        brand(tx, pad, False)
+        ty = pad + 58
+    else:
+        # code on top, everything else stacked underneath and centred
+        brand(0, pad, True)
+        qr_block((W - qpx) // 2, pad + 62)
+        tx = pad
+        centre = True
+        ty = pad + 62 + qpx + 44
 
-    ty = y0 + 208
-    for n, line in enumerate((
-        "Scan the code and install Spancam.",
-        "Open it and turn on Discoverable.",
-        "Join the same Wi-Fi, or plug in USB.",
-        "In OBS, click Refresh and pick the phone.",
-    ), 1):
-        d.ellipse([tx, ty + 2, tx + 30, ty + 32], fill=ACCENT)
-        nw = d.textlength(str(n), font=font(17, True))
-        d.text((tx + (30 - nw) / 2, ty + 8), str(n), font=font(17, True), fill=(255, 255, 255))
-        d.text((tx + 46, ty + 5), line, font=font(23), fill=BODY)
-        ty += 56
+    def line(text, fnt, fill, y):
+        w = d.textlength(text, font=fnt)
+        d.text(((W - w) / 2 if centre else tx, y), text, font=fnt, fill=fill)
 
-    d.text((tx, y1 - 74), "adewaskar.com/apps/spancam", font=font(21), fill=(120, 120, 132))
+    line(TITLE, font(44 if orientation == "landscape" else 40, True), FG, ty)
+    line(SUB, font(23 if orientation == "landscape" else 22), DIM, ty + 62)
 
-    PREVIEW.parent.mkdir(parents=True, exist_ok=True)
-    img.save(PREVIEW, optimize=True)
-    print(f"wrote {PREVIEW.relative_to(ROOT)}  {W}x{H}  {PREVIEW.stat().st_size} bytes (preview)")
+    sy = ty + 116
+    # In portrait the steps stay left-aligned as a block, but the block itself is
+    # centred — a centred ragged list of four sentences is much harder to read.
+    step_w = max(d.textlength(t, font=font(22)) for t in STEPS) + 44
+    sx = (W - step_w) / 2 if centre else tx
+    for n, text in enumerate(STEPS, 1):
+        d.ellipse([sx, sy + 2, sx + 28, sy + 30], fill=ACCENT)
+        nw = d.textlength(str(n), font=font(16, True))
+        d.text((sx + (28 - nw) / 2, sy + 7), str(n), font=font(16, True), fill=(255, 255, 255))
+        d.text((sx + 44, sy + 4), text, font=font(22), fill=BODY)
+        sy += 52
 
-    # Ship a run-length-encoded BGRA blob, not the PNG. A PNG would mean vendoring a
-    # decoder (~250 KB of third-party source) into a plugin that currently has no
-    # dependencies at all, to read one file we produce ourselves. RLE over 32-bit pixels
-    # costs ~166 KB on disk instead of 39 KB, and about forty lines of C to expand.
+    line(FOOTER, font(20), (120, 120, 132), H - pad - 22)
+    return img
+
+
+def emit(img, name):
+    import struct
+    W, H = img.size
     px = img.convert("RGBA").tobytes()
     runs = []
     i, total = 0, W * H
     while i < total:
-        r, g, b, a = px[i * 4:i * 4 + 4]
+        chunk = px[i * 4:i * 4 + 4]
+        r, g, b, a = chunk
         bgra = b | (g << 8) | (r << 16) | (a << 24)
         n = 1
-        while i + n < total and n < 0xFFFF and px[(i + n) * 4:(i + n) * 4 + 4] == px[i * 4:i * 4 + 4]:
+        while i + n < total and n < 0xFFFF and px[(i + n) * 4:(i + n) * 4 + 4] == chunk:
             n += 1
         runs.append((n, bgra))
         i += n
+    assert sum(n for n, _ in runs) == total, "run lengths do not cover the image"
 
-    import struct
-    blob = bytearray(struct.pack("<4sIIII", b"SPCP", 1, W, H, len(runs)))
+    bg = BG[2] | (BG[1] << 8) | (BG[0] << 16) | (0xFF << 24)
+    blob = bytearray(struct.pack("<4sIIIII", b"SPCP", 2, W, H, len(runs), bg))
     for n, bgra in runs:
         blob += struct.pack("<HI", n, bgra)
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_bytes(blob)
-    assert sum(n for n, _ in runs) == total, "run lengths do not cover the image"
-    print(f"wrote {OUT.relative_to(ROOT)}  {len(runs)} runs  {OUT.stat().st_size} bytes (shipped)")
+
+    out = ROOT / "data" / "images" / f"no-phone-{name}.bin"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(blob)
+    preview = HERE / f"no-phone-{name}.png"
+    img.save(preview, optimize=True)
+    print(f"  {name:9} {W}x{H}  {len(runs)} runs  {out.stat().st_size} bytes")
+
+
+def main():
+    if not EMIT.exists():
+        sys.exit(f"missing {EMIT} — build it first (see docstring)")
+    for orientation in LAYOUTS:
+        emit(card(orientation), orientation)
 
 
 if __name__ == "__main__":
