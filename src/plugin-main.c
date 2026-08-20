@@ -62,6 +62,8 @@ static void spancam_check_ffmpeg(void)
 }
 #endif
 
+#include "spancam-placeholder.h"
+
 bool obs_module_load(void)
 {
 #if defined(_WIN32)
@@ -78,6 +80,7 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	spancam_placeholder_free();
 #if defined(_WIN32)
 	WSACleanup();
 #endif

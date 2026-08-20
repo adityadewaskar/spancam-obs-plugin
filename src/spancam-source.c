@@ -31,6 +31,8 @@ fallback that is always available.
 #include <stdlib.h>
 #include <stdint.h>
 
+#include "spancam-placeholder.h"
+
 // Sockets. Winsock is close enough to BSD sockets that a handful of aliases
 // covers the whole difference for what this file does.
 #if defined(_WIN32)
@@ -219,6 +221,9 @@ struct spancam_source {
 	os_event_t *wake;
 	/// True while parked because the source is hidden (drives the one-shot log lines).
 	bool idled;
+	// Has this source ever produced video? Decides how patient the idle card is:
+	// a source that never streamed is a first-run problem, one that has is a blip.
+	bool ever_streamed;
 
 #if defined(SPANCAM_USE_VTDEC)
 	spancam_vtdec_t *vtdec;
@@ -1707,6 +1712,7 @@ static void spancam_stream_once(struct spancam_source *ctx)
 	if (!spancam_open_decoder(ctx, codec_byte))
 		goto done;
 	got_stream = true;
+	ctx->ever_streamed = true;
 	if (used_usb)
 		ctx->usb_cooldown_until_ns = 0; // USB delivered — keep preferring it
 	ctx->ts_base_set = false;               // re-anchor the pacing grid for this connection
@@ -1935,6 +1941,16 @@ static void *spancam_receive_loop(void *data)
 			ctx->redials = 0; // a deliberate resume is not a failure
 		}
 		spancam_stream_once(ctx);
+		// Still no picture: show the setup card instead of an empty rectangle. OBS renders
+		// an async source with no frame as nothing at all, so a first-time user adds the
+		// source, sees blank, and has nothing to act on.
+		//
+		// A source that has NEVER streamed is exactly that first-run case, so speak up on
+		// the first failed dial. One that HAS streamed is far more likely a blip, and
+		// flashing "No phone connected" over a two-second reconnect would be alarming and
+		// usually wrong — let a few rungs of the ladder pass first.
+		if (spancam_should_run(ctx) && ctx->redials >= (ctx->ever_streamed ? 3 : 1))
+			spancam_placeholder_output(ctx->source);
 		int wait = spancam_redial_ms(ctx->redials);
 		if (ctx->promote_now) {
 			ctx->promote_now = false;

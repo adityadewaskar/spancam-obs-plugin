@@ -29,3 +29,6 @@
 
 # Exclude CMake build number cache
 /cmake/.CMakeBuildNumber
+
+# built by tools/make-placeholder.py's docstring recipe
+/tools/emit_qr
