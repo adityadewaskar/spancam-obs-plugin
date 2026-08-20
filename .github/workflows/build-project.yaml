@@ -212,14 +212,22 @@ jobs:
           local target=${pkgs[1]}   # zsh arrays are 1-based
           print "Verifying ${target:t}"
 
-          if [[ ${HAVE_CODESIGN} == 'true' ]] {
-            # Would the SYSTEM accept this installer? Catches a mis-signed or partially signed pkg.
-            spctl -a -vvv -t install ${target}
-          }
           if [[ ${WANT_NOTARIZE} == 'true' ]] {
+            # Would the SYSTEM accept this installer? Catches a mis-signed or partially signed
+            # pkg. Only meaningful once the package is notarized: Gatekeeper assessment of an
+            # installer REQUIRES a notarization ticket, so running this on a merely signed
+            # build reports "rejected (source=Unnotarized Developer ID)" and exits 3 — which
+            # failed every push to main, while saying nothing at all about the signature.
+            spctl -a -vvv -t install ${target}
+
             # Is the ticket actually STAPLED? Notarization that succeeded but failed to staple
             # leaves a package that needs the network to validate on the user's machine.
             xcrun stapler validate -v ${target}
+          } elif [[ ${HAVE_CODESIGN} == 'true' ]] {
+            # Signed but deliberately not notarized (any build that is not a version tag).
+            # Check the signature itself, which needs no ticket, so a broken installer
+            # identity still fails the build here rather than at release time.
+            pkgutil --check-signature ${target}
           }
 
       - name: Upload Artifacts 📡
