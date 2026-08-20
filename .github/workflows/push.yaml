@@ -115,6 +115,54 @@ jobs:
             echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
           done
 
+      - name: Resolve Release Assets 🧭
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Resolve Release Assets 🧭
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+          shopt -s nullglob
+
+          # Classify the built files into the five things the website links to, and refuse to
+          # go any further if an installer is missing. This runs BEFORE Create Release on
+          # purpose: the release is published outright, so a check that ran afterwards would
+          # only complain about something users could already download.
+          version='${{ steps.check.outputs.version }}'
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${version}"
+
+          win_exe='' win_zip='' mac_pkg='' linux_deb='' linux_tar=''
+          for file in "${GITHUB_WORKSPACE}"/@(*.exe|*.zip|*.pkg|*.deb|*.ddeb|*.tar.xz); do
+            name="${file##*/}"
+            case "${name}" in
+              *-dbgsym.@(deb|ddeb) )      continue ;;
+              *-source.tar.xz )           continue ;;
+              *-windows-x64-Installer.exe ) win_exe="${base}/${name}" ;;
+              *-windows-x64.zip )         win_zip="${base}/${name}" ;;
+              *-macos-universal.pkg )     mac_pkg="${base}/${name}" ;;
+              *-macos-universal.tar.xz )  continue ;;
+              *.deb )                     linux_deb="${base}/${name}" ;;
+              *-ubuntu-gnu.tar.xz|*-linux-gnu.tar.xz ) linux_tar="${base}/${name}" ;;
+              * ) echo "::warning title=Unclassified release asset::${name} was built but is not in the paste block." ;;
+            esac
+          done
+
+          missing=()
+          [[ "${win_exe}" ]]   || missing+=('windows .exe')
+          [[ "${mac_pkg}" ]]   || missing+=('macOS .pkg')
+          [[ "${linux_deb}" ]] || missing+=('linux .deb')
+          if (( ${#missing[@]} )); then
+            echo "::error title=Refusing to publish an incomplete release::missing ${missing[*]}."
+            exit 1
+          fi
+
+          {
+            echo "WIN_EXE=${win_exe}"
+            echo "WIN_ZIP=${win_zip}"
+            echo "MAC_PKG=${mac_pkg}"
+            echo "LINUX_DEB=${linux_deb}"
+            echo "LINUX_TAR=${linux_tar}"
+          } >> "${GITHUB_ENV}"
+
       - name: Clear Stale Release Assets 🧹
         if: fromJSON(steps.check.outputs.validTag)
         env:
@@ -195,44 +243,15 @@ jobs:
         run: |
           : Print Download Links 🔗
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
-          shopt -s nullglob
 
           # The website (adewaskar.com/apps/spancam/obs) reads its download URLs from
-          # public/apps/spancam/config.json, which is updated BY HAND after a release is
-          # published. Hand-updating means hand-typing five versioned URLs, and a typo there
-          # is a dead download button that nothing in CI would ever catch. So print the block
-          # ready to paste, derived from the files that were ACTUALLY uploaded a step ago
-          # rather than from a guessed naming scheme.
+          # public/apps/spancam/config.json, updated BY HAND. Hand-updating means hand-typing
+          # five versioned URLs, and a typo there is a dead download button that nothing in CI
+          # would ever catch. So print the block ready to paste. URLs come from
+          # Resolve Release Assets, which already proved every installer exists.
           version='${{ steps.check.outputs.version }}'
-          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${version}"
-
-          win_exe='' win_zip='' mac_pkg='' linux_deb='' linux_tar=''
-          for file in "${GITHUB_WORKSPACE}"/@(*.exe|*.zip|*.pkg|*.deb|*.ddeb|*.tar.xz); do
-            name="${file##*/}"
-            case "${name}" in
-              *-dbgsym.@(deb|ddeb) )      continue ;;
-              *-source.tar.xz )           continue ;;
-              *-windows-x64-Installer.exe ) win_exe="${base}/${name}" ;;
-              *-windows-x64.zip )         win_zip="${base}/${name}" ;;
-              *-macos-universal.pkg )     mac_pkg="${base}/${name}" ;;
-              *-macos-universal.tar.xz )  continue ;;
-              *.deb )                     linux_deb="${base}/${name}" ;;
-              *-ubuntu-gnu.tar.xz|*-linux-gnu.tar.xz ) linux_tar="${base}/${name}" ;;
-              * ) echo "::warning title=Unclassified release asset::${name} was uploaded but is not in the paste block." ;;
-            esac
-          done
-
-          # A missing installer must be loud. Silently printing a block with three of five
-          # URLs is how a platform ends up shipping a button that 404s.
-          missing=()
-          [[ "${win_exe}" ]]   || missing+=('windows .exe')
-          [[ "${mac_pkg}" ]]   || missing+=('macOS .pkg')
-          [[ "${linux_deb}" ]] || missing+=('linux .deb')
-          if (( ${#missing[@]} )); then
-            echo "::error title=Release is missing an installer::${missing[*]} — not printing a partial paste block."
-            exit 1
-          fi
+          win_exe="${WIN_EXE}" win_zip="${WIN_ZIP}" mac_pkg="${MAC_PKG}"
+          linux_deb="${LINUX_DEB}" linux_tar="${LINUX_TAR}"
 
           {
             echo "## 📥 Download links for \`config.json\`"
