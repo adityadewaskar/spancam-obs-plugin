@@ -176,3 +176,87 @@ jobs:
             ${{ github.workspace }}/*.deb
             ${{ github.workspace }}/*.ddeb
             ${{ github.workspace }}/*.tar.xz
+
+      - name: Print Download Links 🔗
+        if: fromJSON(steps.check.outputs.validTag)
+        run: |
+          : Print Download Links 🔗
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+          shopt -s nullglob
+
+          # The website (adewaskar.com/apps/spancam/obs) reads its download URLs from
+          # public/apps/spancam/config.json, which is updated BY HAND after a release is
+          # published. Hand-updating means hand-typing five versioned URLs, and a typo there
+          # is a dead download button that nothing in CI would ever catch. So print the block
+          # ready to paste, derived from the files that were ACTUALLY uploaded a step ago
+          # rather than from a guessed naming scheme.
+          version='${{ steps.check.outputs.version }}'
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${version}"
+
+          win_exe='' win_zip='' mac_pkg='' linux_deb='' linux_tar=''
+          for file in "${GITHUB_WORKSPACE}"/@(*.exe|*.zip|*.pkg|*.deb|*.ddeb|*.tar.xz); do
+            name="${file##*/}"
+            case "${name}" in
+              *-dbgsym.@(deb|ddeb) )      continue ;;
+              *-source.tar.xz )           continue ;;
+              *-windows-x64-Installer.exe ) win_exe="${base}/${name}" ;;
+              *-windows-x64.zip )         win_zip="${base}/${name}" ;;
+              *-macos-universal.pkg )     mac_pkg="${base}/${name}" ;;
+              *-macos-universal.tar.xz )  continue ;;
+              *.deb )                     linux_deb="${base}/${name}" ;;
+              *-ubuntu-gnu.tar.xz|*-linux-gnu.tar.xz ) linux_tar="${base}/${name}" ;;
+              * ) echo "::warning title=Unclassified release asset::${name} was uploaded but is not in the paste block." ;;
+            esac
+          done
+
+          # A missing installer must be loud. Silently printing a block with three of five
+          # URLs is how a platform ends up shipping a button that 404s.
+          missing=()
+          [[ "${win_exe}" ]]   || missing+=('windows .exe')
+          [[ "${mac_pkg}" ]]   || missing+=('macOS .pkg')
+          [[ "${linux_deb}" ]] || missing+=('linux .deb')
+          if (( ${#missing[@]} )); then
+            echo "::error title=Release is missing an installer::${missing[*]} — not printing a partial paste block."
+            exit 1
+          fi
+
+          {
+            echo "## 📥 Download links for \`config.json\`"
+            echo
+            echo "Publish the draft release first — these URLs 404 while it is still a draft."
+            echo
+            echo '| Platform | File | URL |'
+            echo '| --- | --- | --- |'
+            echo "| Windows | installer | ${win_exe} |"
+            [[ "${win_zip}" ]] && echo "| Windows | zip (no SmartScreen prompt) | ${win_zip} |"
+            echo "| macOS | pkg (signed + notarized) | ${mac_pkg} |"
+            echo "| Linux | deb | ${linux_deb} |"
+            [[ "${linux_tar}" ]] && echo "| Linux | tarball | ${linux_tar} |"
+            echo
+            echo "### Paste into \`public/apps/spancam/config.json\`"
+            echo
+            echo 'Replace the whole `"obs"` block. `store` and `demo` are yours to maintain.'
+            echo
+            echo '```json'
+            echo '  "obs": {'
+            echo "    \"min\": \"${version}\","
+            echo "    \"latest\": \"${version}\","
+            echo '    "howToUse": "https://adewaskar.com/apps/spancam/obs",'
+            echo "    \"release\": \"https://github.com/${GITHUB_REPOSITORY}/releases/tag/${version}\","
+            echo '    "downloads": {'
+            echo '      "windows": {'
+            echo "        \"installer\": \"${win_exe}\"$( [[ "${win_zip}" ]] && echo ',' )"
+            [[ "${win_zip}" ]] && echo "        \"zip\": \"${win_zip}\""
+            echo '      },'
+            echo '      "macos": {'
+            echo "        \"pkg\": \"${mac_pkg}\""
+            echo '      },'
+            echo '      "linux": {'
+            echo "        \"deb\": \"${linux_deb}\"$( [[ "${linux_tar}" ]] && echo ',' )"
+            [[ "${linux_tar}" ]] && echo "        \"tarball\": \"${linux_tar}\""
+            echo '      }'
+            echo '    }'
+            echo '  }'
+            echo '```'
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
