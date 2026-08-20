@@ -141,10 +141,8 @@ static bool spcp_load(const char *name, struct spcp_card *card)
 	uint32_t runs = spcp_rd32(blob + 16);
 	uint32_t background = spcp_rd32(blob + 20);
 
-	if (version != SPCP_VERSION || width == 0 || height == 0 || width > SPCP_MAX_DIM ||
-	    height > SPCP_MAX_DIM) {
-		obs_log(LOG_WARNING, "Spancam: %s rejected (version %u, %ux%u)", name, version, width,
-			height);
+	if (version != SPCP_VERSION || width == 0 || height == 0 || width > SPCP_MAX_DIM || height > SPCP_MAX_DIM) {
+		obs_log(LOG_WARNING, "Spancam: %s rejected (version %u, %ux%u)", name, version, width, height);
 		bfree(blob);
 		return false;
 	}
@@ -213,8 +211,8 @@ bool spancam_placeholder_init(void)
 				     "picture when there is no phone");
 		return false;
 	}
-	obs_log(LOG_INFO, "Spancam: idle card loaded (landscape %s, portrait %s)",
-		land ? "yes" : "no", port ? "yes" : "no");
+	obs_log(LOG_INFO, "Spancam: idle card loaded (landscape %s, portrait %s)", land ? "yes" : "no",
+		port ? "yes" : "no");
 	return true;
 }
 
@@ -329,8 +327,7 @@ void spancam_placeholder_output(obs_source_t *source)
 	/* Taller than wide gets the stacked layout. Fall back to whichever card did load, so
 	 * one missing asset degrades to a wrong-shaped card rather than to no card. */
 	int want = (ovi.base_height > ovi.base_width) ? SPCP_PORTRAIT : SPCP_LANDSCAPE;
-	const struct spcp_card *card = s_cards[want].px ? &s_cards[want]
-							: &s_cards[want ^ 1];
+	const struct spcp_card *card = s_cards[want].px ? &s_cards[want] : &s_cards[want ^ 1];
 	if (!spancam_compose(card, ovi.base_width, ovi.base_height))
 		return;
 
