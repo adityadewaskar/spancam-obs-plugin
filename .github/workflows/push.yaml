@@ -129,11 +129,21 @@ jobs:
           # below is the only thing on it. A DRAFT carries no public URL, so nothing breaks; a
           # published release is left alone rather than yanked from under anyone.
           tag='${{ steps.check.outputs.version }}'
-          if gh release view "${tag}" --json isDraft -q .isDraft 2>/dev/null | grep -qx true; then
+          if ! state=$(gh release view "${tag}" --json isDraft -q .isDraft 2>/dev/null); then
+            echo "No existing release for ${tag} — nothing to clear."
+          elif [[ "${state}" == 'true' ]]; then
             echo "Deleting the existing DRAFT for ${tag} so its assets cannot outlive this build."
             gh release delete "${tag}" --yes --cleanup-tag=false
           else
-            echo "No draft release for ${tag} (or it is already published) — leaving it alone."
+            # Strip the assets but KEEP the release: deleting a published release would 404 a
+            # URL that is already on the website and in users' hands. Emptying it instead
+            # leaves the upload below as the only thing on the release.
+            echo "${tag} is already published — clearing its assets rather than yanking the release."
+            gh release view "${tag}" --json assets -q '.assets[].name' | while read -r asset; do
+              [[ -n "${asset}" ]] || continue
+              echo "  deleting ${asset}"
+              gh release delete-asset "${tag}" "${asset}" --yes
+            done
           fi
 
       - name: Compose Release Notes 📝
@@ -161,7 +171,10 @@ jobs:
         # v3.0.2 (commit verified against the tag object via the API, not copied on trust).
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
-          draft: true
+          # Published outright: a tag push is the release. The draft step existed so a human
+          # could eyeball the assets, but that made every release a two-part job where the
+          # download links stayed 404 until someone remembered to click publish.
+          draft: false
           prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
           tag_name: ${{ steps.check.outputs.version }}
           name: ${{ needs.build-project.outputs.pluginName }} ${{ steps.check.outputs.version }}
@@ -224,7 +237,7 @@ jobs:
           {
             echo "## 📥 Download links for \`config.json\`"
             echo
-            echo "Publish the draft release first — these URLs 404 while it is still a draft."
+            echo "The release is already published, so every URL below is live right now."
             echo
             echo '| Platform | File | URL |'
             echo '| --- | --- | --- |'
