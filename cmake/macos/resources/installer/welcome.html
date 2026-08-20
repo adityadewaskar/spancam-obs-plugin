@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  /* Deliberately no colours: this pane is painted by the installer and follows the
+     system appearance, so a hardcoded palette breaks either light or dark mode. */
+  body { font: 13px -apple-system, "Helvetica Neue", sans-serif; margin: 0; line-height: 1.5; }
+  h1 { font-size: 15px; margin: 0 0 10px; }
+  p { margin: 0 0 10px; }
+  ol { margin: 6px 0 10px 18px; padding: 0; }
+  li { margin-bottom: 4px; }
+  .after { font-size: 12px; opacity: 0.75; }
+</style></head>
+<body>
+  <h1>Spancam for OBS</h1>
+  <p>Use your Android phone or iPhone as a camera source in OBS Studio, over Wi&#8209;Fi or
+     USB, with no desktop helper app in between.</p>
+  <p>This installs one plugin into your OBS plugins folder. Nothing else on your Mac is
+     touched, and no background service is added.</p>
+  <p class="after">After installing:</p>
+  <ol class="after">
+    <li>Quit OBS completely and open it again &mdash; it only scans for plugins at start.</li>
+    <li>Choose <b>Sources &rarr; + &rarr; Spancam Camera</b>.</li>
+    <li>The source shows a QR code to install the phone app if you have not yet.</li>
+  </ol>
+</body>
+</html>

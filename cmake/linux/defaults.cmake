@@ -18,8 +18,26 @@ set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CM
 
 set(CPACK_GENERATOR "DEB")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${PLUGIN_EMAIL}")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${PLUGIN_AUTHOR} <${PLUGIN_EMAIL}>")
 set(CPACK_SET_DESTDIR ON)
+
+# apt and dpkg ARE the installer on Linux — there is no window to brand — so the package's
+# own metadata is the only thing a user ever sees. Left to CMake's defaults, `apt show`
+# read "spancam-for-obs built using CMake", with no homepage and filed under devel.
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Use your phone as a camera source in OBS Studio")
+set(
+  CPACK_DEBIAN_PACKAGE_DESCRIPTION
+  "Use your phone as a camera source in OBS Studio
+ Spancam for OBS adds a \"Spancam Camera\" source to OBS Studio that takes video
+ straight from an Android phone or iPhone over Wi-Fi or USB, with no desktop helper
+ application in between.
+ .
+ Requires the free Spancam app on the phone, and OBS Studio 28 or newer. Restart OBS
+ after installing so it picks the plugin up."
+)
+set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "${PLUGIN_WEBSITE}")
+# video, not devel: this is an end-user plugin, not a build dependency.
+set(CPACK_DEBIAN_PACKAGE_SECTION "video")
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.25.0 OR NOT CMAKE_CROSSCOMPILING)
   set(CPACK_DEBIAN_DEBUGINFO_PACKAGE ON)

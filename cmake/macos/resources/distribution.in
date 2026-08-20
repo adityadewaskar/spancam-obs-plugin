@@ -7,6 +7,18 @@
         allow-external-scripts="no" />
     <domains enable_currentUserHome="true" enable_anywhere="false" enable_localSystem="false" />
     <title>Spancam for OBS</title>
+    <!-- Branding. These filenames resolve against the resources directory that
+         create-package.cmake.in hands to productbuild. The backgrounds are transparent
+         PNGs so one asset works on whichever surface the installer paints, and darkAqua
+         gets its own so the wordmark does not end up black on black.
+         Note: no double hyphen anywhere in here, XML forbids it inside a comment and
+         productbuild rejects the whole distribution file if it appears. -->
+    <background file="installer-background.png" mime-type="image/png"
+                alignment="bottomleft" scaling="none" />
+    <background-darkAqua file="installer-background-dark.png" mime-type="image/png"
+                         alignment="bottomleft" scaling="none" />
+    <welcome file="welcome.html" mime-type="text/html" />
+    <conclusion file="conclusion.html" mime-type="text/html" />
     <choices-outline>
         <line choice="obs-plugin" />
     </choices-outline>
