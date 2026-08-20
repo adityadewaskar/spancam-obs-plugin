@@ -30,5 +30,5 @@
 # Exclude CMake build number cache
 /cmake/.CMakeBuildNumber
 
-# built by tools/make-placeholder.py's docstring recipe
-/tools/emit_qr
+# emit_qr is compiled on demand by build-aux/placeholder/make-placeholder.py
+/build-aux/placeholder/emit_qr
