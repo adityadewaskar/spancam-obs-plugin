@@ -1635,8 +1635,8 @@ static spancam_socket_t spancam_dial(struct spancam_source *ctx, char *token_out
 					obs_source_get_name(ctx->source), mdevice, host, port);
 			else
 				obs_log(LOG_WARNING,
-					"Spancam[%s]: pinned phone \"%s\" is NOT on the network — this source "
-					"stays black rather than grabbing a different phone",
+					"Spancam[%s]: pinned phone \"%s\" is NOT on the network — showing the "
+					"setup card rather than grabbing a different phone",
 					obs_source_get_name(ctx->source), mdevice);
 		} else if (spancam_udp_discover(ctx, host, sizeof(host), &port, token, sizeof(token))) {
 			resolved = true; // Android answers the UDP broadcast
@@ -1874,6 +1874,24 @@ done:
 	obs_source_output_video(ctx->source, NULL);
 }
 
+// The card is authored upright — but obs_source_set_async_rotation is STICKY. Whatever
+// rotation the phone's video last needed stays on the source, and OBS keeps applying it to
+// every later frame, including this one. A source whose phone streamed at 90 degrees showed
+// the setup card lying on its side, which read as "the orientation logic is broken" when the
+// card itself was fine.
+//
+// Zero the rotation AND the cached value, so the next real frame sees a mismatch and
+// re-applies whatever the phone actually needs. Flip needs no undoing: it travels per frame,
+// and the card simply does not set it.
+static void spancam_show_card(struct spancam_source *ctx)
+{
+	if (ctx->applied_rotation != 0) {
+		obs_source_set_async_rotation(ctx->source, 0);
+		ctx->applied_rotation = 0;
+	}
+	spancam_placeholder_output(ctx->source);
+}
+
 // The Mac receiver's paced redial ladder: 1/6/12/24/48/60 s. A phone that is
 // simply gone should not be dialled at 1.5 s forever — that is a busy loop
 // against the void which, with a blocking connect, also keeps a thread hot and
@@ -1950,14 +1968,14 @@ static void *spancam_receive_loop(void *data)
 		// disconnect path further down, so posting the card only there left exactly the
 		// most common case — a phone that is simply not there — showing nothing at all.
 		if (spancam_should_run(ctx))
-			spancam_placeholder_output(ctx->source);
+			spancam_show_card(ctx);
 
 		spancam_stream_once(ctx);
 
 		// stream_once only ever returns when there is no video: the dial failed, or the
 		// connection it had just ended. Either way, put the card back up.
 		if (spancam_should_run(ctx))
-			spancam_placeholder_output(ctx->source);
+			spancam_show_card(ctx);
 
 		int wait = spancam_redial_ms(ctx->redials);
 		if (ctx->promote_now) {
@@ -1981,7 +1999,7 @@ static void *spancam_receive_loop(void *data)
 			os_event_timedwait(ctx->stop_signal, slice);
 			left -= slice;
 			if (spancam_should_run(ctx) && spancam_placeholder_stale())
-				spancam_placeholder_output(ctx->source);
+				spancam_show_card(ctx);
 		}
 	}
 	return NULL;
